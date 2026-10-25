@@ -246,28 +246,41 @@ function localTimeAt(date, minute, meta) {
   return null;
 }
 function withSolarEvents(hours, s, now, stale) {
-  if (stale) return hours;
-  const end = hours[hours.length - 1].at;
+  const regular = hours.slice(0, 6);
+  if (stale) return regular;
+  const end = regular[regular.length - 1].at;
   const events = [];
   for (const a of s.astro) for (const [field, code, detail] of [['rise', 'SUNRISE', '日出'], ['set', 'SUNSET', '日落']]) {
     const at = localTimeAt(a.date, a[field], s);
-    if (at === null || at <= now || at > end) continue;
+    if (at === null || at <= now - HOUR || at > end) continue;
     const p = localParts(at, s);
     events.push({ at, code, detail, temperature: null, day: true,
       label: `${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')}` });
   }
-  if (!events.length) return hours;
-  // 整点前即将日出/日落时，用事件替换“现在”；其余事件按时间插入。
-  const imminent = events.some(e => e.at <= hours[1].at);
+  if (!events.length) return regular;
+  // 刚发生或整点前即将发生的日出/日落替换“现在”，保留明确的事件时间。
+  const imminent = events.some(e => e.at < hours[1].at);
   const occupied = new Set(events.map(e => e.at));
   return [...hours.filter((h, i) => !(imminent && i === 0) && !occupied.has(h.at)), ...events]
     .sort((a, b) => a.at - b.at).slice(0, 6);
+}
+function twilightAt(s, now) {
+  const date = localParts(now, s).date, astro = s.astro.find(a => a.date === date);
+  if (!astro) return null;
+  const sunset = localTimeAt(date, astro.set, s), sunrise = localTimeAt(date, astro.rise, s);
+  if (sunset !== null && now >= sunset && now < sunset + 90 * MINUTE) {
+    return { phase: 'dusk', amount: (now - sunset) / (90 * MINUTE) };
+  }
+  if (sunrise !== null && now >= sunrise - 45 * MINUTE && now < sunrise + 15 * MINUTE) {
+    return { phase: 'dawn', amount: (now - sunrise + 45 * MINUTE) / HOUR };
+  }
+  return null;
 }
 export function viewModel(s, config, geo, now, stale = false) {
   const today = localParts(now, s).date, currentDay = s.days.find(d => d.date === today);
   const floor = hourFloor(now, s), byHour = new Map(s.hours.map(h => [h.at, h]));
   const hours = [{ ...s.current, at: now, label: stale ? '上次' : '现在', day: daytime(stale ? s.fetchedAt : now, s, s.current.code) }];
-  for (let i = 1; i <= 5; i++) {
+  for (let i = 1; i <= 6; i++) {
     const at = floor + i * HOUR, h = byHour.get(at);
     hours.push({ at, temperature: h?.temperature ?? null, code: h?.code || 'UNKNOWN',
       label: `${localParts(at, s).hour}时`, day: daytime(at, s, h?.code || ''), missing: !h });
@@ -279,7 +292,7 @@ export function viewModel(s, config, geo, now, stale = false) {
   });
   return { title: config.title || geo?.name || config.region, ...s.current, ...condition(s.current.code),
     low: currentDay?.low ?? null, high: currentDay?.high ?? null, hours: withSolarEvents(hours, s, now, stale), days,
-    isDay: daytime(now, s, s.current.code), stale, fetchedAt: s.fetchedAt };
+    isDay: daytime(now, s, s.current.code), twilight: twilightAt(s, now), stale, fetchedAt: s.fetchedAt };
 }
 
 // ---------- 图标：组合图标为内置 SVG，简单图标使用 SF Symbols ----------
@@ -322,7 +335,17 @@ export function themeFor(model) {
     haze: ['#7D8995', '#707C89', '#616E7C'], storm: ['#4D5D73', '#394D66', '#293C55'],
     wind: ['#638198', '#54758E', '#42647E'],
   };
-  return { type: 'linear', colors: model.isDay ? themes[model.kind] || themes.cloud : ['#17263F', '#2D405B', '#42556D'],
+  const night = ['#17263F', '#2D405B', '#42556D'];
+  let colors = model.isDay ? themes[model.kind] || themes.cloud : night;
+  if (model.twilight && ['clear', 'partly', 'cloud', 'fog', 'haze'].includes(model.kind)) {
+    const mix = (a, b, amount) => '#' + [1, 3, 5].map(i => Math.round(parseInt(a.slice(i, i + 2), 16) * (1 - amount)
+      + parseInt(b.slice(i, i + 2), 16) * amount).toString(16).padStart(2, '0')).join('');
+    const t = Math.max(0, Math.min(1, model.twilight.amount));
+    const dusk = ['#536C9A', '#9295B4', '#C1A59E'];
+    colors = model.twilight.phase === 'dusk' ? dusk.map((c, i) => mix(c, night[i], t))
+      : ['#6B7DAB', '#AA9AB5', '#D5B7A8'].map((c, i) => mix(c, (themes[model.kind] || themes.cloud)[i], t));
+  }
+  return { type: 'linear', colors,
     startPoint: { x: 0.5, y: 0 }, endPoint: { x: 0.5, y: 1 } };
 }
 export function rangeURI(day, days, current) {
@@ -396,7 +419,7 @@ export function renderWidget(m, family, config, refreshAt) {
     url: detailURL(config.region), refreshAfter: new Date(refreshAt).toISOString(), children: [] };
   if (small) {
     const size = m.stale ? 34 : 42;
-    root.children = [row([text(m.title, 14, { font: { size: 14, weight: 'medium' } }), spacer()], { height: 18 }),
+    root.children = [row([text(m.title, 14, { font: { size: 14, weight: 'medium' } }), spacer()], { height: 17 }),
       row([text(temperatureText(m.temperature), size, { font: { size, weight: 'light' } }), spacer()], { height: m.stale ? 41 : 51 }),
       spacer(), row([icon(m.code, m.isDay, m.stale ? 16 : 18), spacer()], { height: m.stale ? 16 : 18 }),
       row([text(m.label, m.stale ? 11 : 12), spacer()], { height: m.stale ? 14 : 15 }),
@@ -420,7 +443,7 @@ export function renderWidget(m, family, config, refreshAt) {
     column([
       row([spacer(), icon(m.code, m.isDay, symbolSize)], { height: symbolSize }),
       row([spacer(), text(m.label, conditionSize)], { height: conditionSize * 1.2 }),
-      highLow(m, rangeSize, rightWidth),
+      highLow(m, rangeSize, rightWidth - 12),
     ], { width: rightWidth, alignItems: 'end', gap: 1 }),
   ], { height: headerHeight, alignItems: 'start' });
   // 中尺寸把整组内容垂直居中；不在当前天气和小时预报之间留下弹性空洞。
