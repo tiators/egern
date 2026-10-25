@@ -10,6 +10,8 @@ const HEADERS = {
 };
 const MINUTE = 60000, HOUR = 60 * MINUTE, DAY = 24 * HOUR;
 const STALE_LIMIT = 6 * HOUR;
+const SNAPSHOT_VERSION = 2;
+// 固定槽名保持不变；内容版本独立升级，避免遗留第三条缓存记录。
 export const CACHE_KEYS = Object.freeze({ geo: 'egern.weather.geo.v1', weather: 'egern.weather.snapshot.v1' });
 const LIMITS = { geo: 768, weather: 3328 }; // 包含键名的 UTF-8 字节数。
 const finite = n => typeof n === 'number' && Number.isFinite(n);
@@ -55,7 +57,7 @@ function read(ctx, kind, region) {
     if (typeof raw !== 'string' || utf8Bytes(raw) + utf8Bytes(CACHE_KEYS[kind]) > LIMITS[kind]) throw Error();
     const value = JSON.parse(raw);
     if (value === null) return null;
-    if (value.version !== 1 || value.region !== region) throw Error();
+    if (!(kind === 'weather' ? [1, SNAPSHOT_VERSION].includes(value.version) : value.version === 1) || value.region !== region) throw Error();
     return value;
   } catch (_) { remove(ctx, kind); return null; }
 }
@@ -80,7 +82,7 @@ function validSnapshot(s, now) {
   return finite(s.fetchedAt) && s.fetchedAt <= now && nullable(s.sourceAt)
     && typeof s.timezone === 'string' && finite(s.shift) && Math.abs(s.shift) <= 86400
     && onlyKeys(s.current, ['temperature', 'code']) && finite(s.current?.temperature) && typeof s.current?.code === 'string'
-    && Array.isArray(s.hours) && s.hours.length <= 6
+    && Array.isArray(s.hours) && s.hours.length <= 7
     && s.hours.every(h => onlyKeys(h, ['at', 'temperature', 'code']) && finite(h.at) && nullable(h.temperature) && typeof h.code === 'string')
     && Array.isArray(s.days) && s.days.length <= 5
     && s.days.every(d => onlyKeys(d, ['date', 'low', 'high', 'code']) && isDate(d.date) && nullable(d.low) && nullable(d.high) && typeof d.code === 'string')
@@ -90,7 +92,7 @@ function validSnapshot(s, now) {
 function failureState(region, old, now) {
   const failures = Math.min(3, (old?.failures || 0) + 1);
   const base = old?.current && ageWithin(old.fetchedAt, STALE_LIMIT, now) ? prune(old, now) : { version: 1, region };
-  return { ...base, failures, retryAt: now + [5, 15, 30][failures - 1] * MINUTE };
+  return { ...base, version: SNAPSHOT_VERSION, failures, retryAt: now + [5, 15, 30][failures - 1] * MINUTE };
 }
 
 // ---------- 网络：请求预算统一管理，绝不输出带 ticket 的 URL ----------
@@ -181,7 +183,7 @@ export function normalizeWeather(data, region, now) {
     throw new WeatherError('当前天气暂不可用');
   }
   const shift = numeric(data.tzshift);
-  const snapshot = { version: 1, region, fetchedAt: now, sourceAt: numeric(data.server_time),
+  const snapshot = { version: SNAPSHOT_VERSION, region, fetchedAt: now, sourceAt: numeric(data.server_time),
     timezone: short(data.timezone, 64), shift: shift !== null && Math.abs(shift) <= 86400 ? shift : 28800,
     current: { temperature: numeric(current.temperature), code: codeOf(current.skycon) },
     hours: [], days: [], astro: [], failures: 0, retryAt: 0 };
@@ -190,7 +192,8 @@ export function normalizeWeather(data, region, now) {
   const hourly = r.hourly?.status === 'ok' ? r.hourly : {};
   const ht = rows(hourly.temperature, 'datetime', true), hs = rows(hourly.skycon, 'datetime', true);
   const floor = hourFloor(now, snapshot);
-  for (let i = 1; i <= 6; i++) {
+  // 六个未来整点加一个跨整点备用值，最大刷新间隔为一小时。
+  for (let i = 1; i <= 7; i++) {
     const at = floor + i * HOUR;
     if (ht.has(at) || hs.has(at)) snapshot.hours.push({ at, temperature: numeric(ht.get(at)?.value), code: codeOf(hs.get(at)?.value) });
   }
@@ -276,6 +279,16 @@ function twilightAt(s, now) {
   }
   return null;
 }
+function forecastSummary(day) {
+  if (!day || day.missing) return { text: '明天预报暂不可用', symbol: 'calendar' };
+  const weather = condition(day.code);
+  const label = weather.kind === 'unknown' ? '' : weather.label;
+  const temperatures = finite(day.low) && finite(day.high) ? `${temperatureText(day.low)}–${temperatureText(day.high)}`
+    : finite(day.high) ? `最高${temperatureText(day.high)}` : finite(day.low) ? `最低${temperatureText(day.low)}` : '';
+  if (!label && !temperatures) return { text: '明天预报暂不可用', symbol: 'calendar' };
+  return { text: `明天${label}${label && temperatures ? '，' : ''}${temperatures}`,
+    symbol: ['rain', 'storm'].includes(weather.kind) ? 'umbrella.fill' : 'calendar' };
+}
 export function viewModel(s, config, geo, now, stale = false) {
   const today = localParts(now, s).date, currentDay = s.days.find(d => d.date === today);
   const floor = hourFloor(now, s), byHour = new Map(s.hours.map(h => [h.at, h]));
@@ -290,8 +303,11 @@ export function viewModel(s, config, geo, now, stale = false) {
     const label = i === 0 ? '今天' : i === 1 ? '明天' : ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(`${date}T12:00:00Z`).getUTCDay()];
     return { date, label, low: d?.low ?? null, high: d?.high ?? null, code: d?.code || 'UNKNOWN', missing: !d };
   });
+  const futureDays = days.slice(1).map(d => ({ ...d,
+    label: ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(`${d.date}T12:00:00Z`).getUTCDay()] }));
   return { title: config.title || geo?.name || config.region, ...s.current, ...condition(s.current.code),
     low: currentDay?.low ?? null, high: currentDay?.high ?? null, hours: withSolarEvents(hours, s, now, stale), days,
+    upcomingHours: hours.slice(1, 7), futureDays, summary: forecastSummary(futureDays[0]),
     isDay: daytime(now, s, s.current.code), twilight: twilightAt(s, now), stale, fetchedAt: s.fetchedAt };
 }
 
@@ -335,7 +351,7 @@ export function themeFor(model) {
     haze: ['#7D8995', '#707C89', '#616E7C'], storm: ['#4D5D73', '#394D66', '#293C55'],
     wind: ['#638198', '#54758E', '#42647E'],
   };
-  const night = ['#17263F', '#2D405B', '#42556D'];
+  const night = ['#201D31', '#252640', '#2B3552'];
   let colors = model.isDay ? themes[model.kind] || themes.cloud : night;
   if (model.twilight && ['clear', 'partly', 'cloud', 'fog', 'haze'].includes(model.kind)) {
     const mix = (a, b, amount) => '#' + [1, 3, 5].map(i => Math.round(parseInt(a.slice(i, i + 2), 16) * (1 - amount)
@@ -358,25 +374,33 @@ function skyBackground(m, family) {
   return svgData(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 ${w} ${h}'>
 <defs>
 <linearGradient id='sky' x1='0' y1='0' x2='0' y2='1'>${stops}</linearGradient>
-<radialGradient id='air'><stop stop-color='#FFFFFF' stop-opacity='${m.isDay ? 0.07 : 0.035}'/><stop offset='1' stop-color='#FFFFFF' stop-opacity='0'/></radialGradient>
-<radialGradient id='horizon'><stop stop-color='${horizon}' stop-opacity='${twilight ? 0.15 : 0.045}'/><stop offset='1' stop-color='${horizon}' stop-opacity='0'/></radialGradient>
+<radialGradient id='air'><stop stop-color='#FFFFFF' stop-opacity='${m.isDay ? 0.07 : 0.01}'/><stop offset='1' stop-color='#FFFFFF' stop-opacity='0'/></radialGradient>
+<radialGradient id='horizon'><stop stop-color='${horizon}' stop-opacity='${twilight ? 0.15 : m.isDay ? 0.045 : 0.01}'/><stop offset='1' stop-color='${horizon}' stop-opacity='0'/></radialGradient>
 </defs>
 <rect width='${w}' height='${h}' fill='url(#sky)'/>
 <ellipse cx='${w * 0.2}' cy='0' rx='${w * 0.9}' ry='${h * 0.8}' fill='url(#air)'/>
 <ellipse cx='${w * 0.62}' cy='${h * 1.04}' rx='${w * 0.85}' ry='${h * 0.65}' fill='url(#horizon)'/>
 </svg>`);
 }
-export function rangeURI(day, days, current) {
-  const values = days.flatMap(d => [d.low, d.high]).filter(finite);
-  const min = Math.min(...values), max = Math.max(...values);
-  const position = n => 4 + (max === min ? 0.5 : Math.max(0, Math.min(1, (n - min) / (max - min)))) * 112;
-  let body = "<defs><linearGradient id='bar'><stop stop-color='#75D6D8'/><stop offset='.5' stop-color='#B0DBA2'/><stop offset='1' stop-color='#FFD278'/></linearGradient></defs><rect x='2' y='3' width='116' height='4' rx='2' fill='white' fill-opacity='.18'/>";
-  if (finite(day.low) && finite(day.high) && day.low <= day.high && values.length) {
-    const left = position(day.low), right = position(day.high), width = Math.max(3, right - left);
-    body += `<rect x='${Math.min(left, 118 - width)}' y='3' width='${width}' height='4' rx='2' fill='url(#bar)'/>`;
-    if (finite(current) && current >= day.low && current <= day.high) body += `<circle cx='${position(current)}' cy='5' r='2.8' fill='white' stroke='#526D84' stroke-width='1'/>`;
-  }
-  return svgData(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 10'>${body}</svg>`);
+const TEMPERATURE_COLORS = [[-20, '#828CE5'], [0, '#7AC9D9'], [10, '#A8D39B'], [16, '#D0D96B'], [20, '#EBDD40'], [25, '#FFD028'], [30, '#F6A23C'], [40, '#EC6E51']];
+export function temperatureColor(value) {
+  const t = Math.max(TEMPERATURE_COLORS[0][0], Math.min(TEMPERATURE_COLORS[TEMPERATURE_COLORS.length - 1][0], value));
+  const upper = TEMPERATURE_COLORS.findIndex(stop => stop[0] >= t);
+  if (upper <= 0) return TEMPERATURE_COLORS[0][1];
+  const [a, from] = TEMPERATURE_COLORS[upper - 1], [b, to] = TEMPERATURE_COLORS[upper], amount = (t - a) / (b - a);
+  return '#' + [1, 3, 5].map(i => Math.round(parseInt(from.slice(i, i + 2), 16) * (1 - amount)
+    + parseInt(to.slice(i, i + 2), 16) * amount).toString(16).padStart(2, '0')).join('');
+}
+export function temperatureRange(day, days) {
+  const valid = d => finite(d?.low) && finite(d?.high) && d.low <= d.high;
+  const values = days.filter(valid).flatMap(d => [d.low, d.high]);
+  if (!valid(day) || !values.length) return null;
+  const min = Math.min(...values), max = Math.max(...values), extent = max - min;
+  const span = extent ? Math.max(0.025, (day.high - day.low) / extent) : 0.025;
+  const before = extent ? Math.min((day.low - min) / extent, 1 - span) : (1 - span) / 2;
+  const points = [day.low, ...TEMPERATURE_COLORS.map(([t]) => t).filter(t => t > day.low && t < day.high), day.high];
+  return { before, span, after: Math.max(0, 1 - before - span), colors: points.map(temperatureColor),
+    stops: day.low === day.high ? [0, 1] : points.map(t => (t - day.low) / (day.high - day.low)) };
 }
 
 // ---------- UI：以用户当前实机截图为基准，三尺寸共用排版组件 ----------
@@ -404,12 +428,12 @@ const row = (children, extra = {}) => ({ type: 'stack', direction: 'row', alignI
 const column = (children, extra = {}) => ({ type: 'stack', direction: 'column', alignItems: 'start', children, ...extra });
 const spacer = length => length === undefined ? { type: 'spacer' } : { type: 'spacer', length };
 const icon = (code, day, width, height = width) => ({ type: 'image', ...iconSource(code, day), width, height, resizeMode: 'contain' });
-const detailURL = region => `${H5}/h5?city=${encodeURIComponent(region)}`;
+const detailURL = `${H5}/h5`;
 const leading = (node, height) => row([node, spacer()], { height });
 const trailing = (node, height) => row([spacer(), node], { height });
 const centered = (node, height) => row([spacer(), node, spacer()], { height });
 function separator() {
-  return { type: 'image', src: svgData("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 320 1'><path d='M0 .5H320' stroke='white' stroke-opacity='.18'/></svg>"), height: 1, resizeMode: 'cover' };
+  return row([spacer()], { height: 0.5, backgroundColor: '#FFFFFF26' });
 }
 function updateLabel(at) {
   return row([text('上次更新', 9, { opacity: 0.8 }), { type: 'date', date: new Date(at).toISOString(), format: 'relative',
@@ -438,34 +462,54 @@ function currentHeader(m, p) {
   // 使用固定宽度、内部首尾 spacer；不让 flex frame 改变内容的实际对齐。
   return row([left, spacer(), right], { height, alignItems: 'start' });
 }
-function hourlyTimeline(m, p) {
+function hourlyTimeline(m, p, upcoming = false) {
   const labelHeight = lineHeight(p.hourLabel), temperatureHeight = lineHeight(p.hourTemperature);
   const height = labelHeight + 4 + p.hourIconHeight + 3 + temperatureHeight;
-  const slots = Array.from({ length: 6 }, (_, i) => m.hours[i] || { label: '—', missing: true, temperature: null });
-  return row(slots.map(h => column([
+  const hours = upcoming ? m.upcomingHours : m.hours;
+  const slots = Array.from({ length: 6 }, (_, i) => hours[i] || { label: '—', missing: true, temperature: null });
+  const columns = slots.map(h => column([
     centered(text(h.label, p.hourLabel, { font: { size: p.hourLabel, weight: 'medium' }, opacity: UI.secondary, textAlign: 'center' }), labelHeight),
     spacer(4),
     h.missing ? centered(text('—', 13, { opacity: 0.5 }), p.hourIconHeight) : icon(h.code, h.day, p.hourIconWidth, p.hourIconHeight),
     spacer(3),
     centered(text(h.detail || temperatureText(h.temperature), h.detail ? p.hourLabel : p.hourTemperature,
       { font: { size: h.detail ? p.hourLabel : p.hourTemperature, weight: 'medium' }, textAlign: 'center' }), temperatureHeight),
-  ], { flex: 1, alignItems: 'center' })), { height });
+  ], { ...(upcoming ? { width: 28 } : { flex: 1 }), alignItems: 'center' }));
+  return row(upcoming ? columns.flatMap((c, i) => i ? [spacer(), c] : [c]) : columns, { height });
 }
-function cell(value, width, opacity = 1, align = 'end') {
-  return column([text(value, 12, { opacity, textAlign: align === 'end' ? 'right' : 'left' })], { width, alignItems: align });
+function dailyCell(node, flex, align) {
+  const wrap = align === 'end' ? trailing : align === 'start' ? leading : centered;
+  return column([wrap(node, 25)], { flex, alignItems: align });
+}
+function rangeBar(day, days) {
+  const range = temperatureRange(day, days);
+  if (!range) return row([spacer()], { flex: 1, height: 4, backgroundColor: '#FFFFFF08', borderRadius: 2 });
+  const parts = [];
+  if (range.before > 0) parts.push({ type: 'spacer', flex: range.before });
+  parts.push(row([], { flex: range.span, height: 4, borderRadius: 2,
+    backgroundGradient: { type: 'linear', colors: range.colors, stops: range.stops,
+      startPoint: { x: 0, y: 0 }, endPoint: { x: 1, y: 0 } } }));
+  if (range.after > 0) parts.push({ type: 'spacer', flex: range.after });
+  return row(parts, { flex: 1, height: 4 });
 }
 function dailyTable(m) {
-  const children = [];
-  m.days.forEach((d, i) => {
+  const children = [{ type: 'spacer', flex: 0.5 }];
+  m.futureDays.forEach((d, i) => {
     children.push(row([
-      cell(d.label, 28, 1, 'start'), d.missing ? cell('—', 20, 0.5, 'center') : icon(d.code, true, 20, 17),
-      cell(temperatureText(d.low), 31, UI.muted),
-      { type: 'image', src: rangeURI(d, m.days, !m.stale && i === 0 ? m.temperature : null), height: 9, flex: 1, resizeMode: 'contain' },
-      cell(temperatureText(d.high), 31),
-    ], { height: 24, gap: 5 }));
-    if (i < 4) children.push(spacer());
+      dailyCell(text(d.label, 14, { font: { size: 14, weight: 'medium' } }), 1, 'start'),
+      dailyCell(d.missing ? text('—', 13, { opacity: 0.4 }) : icon(d.code, true, 26, 24), 1, 'center'),
+      dailyCell(text(temperatureText(d.low), 14, { font: { size: 14, weight: 'semibold' }, opacity: 0.38 }), 1.5, 'center'),
+      row([spacer(8), rangeBar(d, m.futureDays)], { flex: 2.4, height: 4 }),
+      dailyCell(text(temperatureText(d.high), 14, { font: { size: 14, weight: 'semibold' }, textAlign: 'right' }), 0.7, 'end'),
+    ], { height: 25 }));
+    if (i < 3) children.push(spacer());
   });
+  children.push({ type: 'spacer', flex: 0.5 });
   return column(children, { flex: 1 });
+}
+function summaryRow(m) {
+  return row([{ type: 'image', src: `sf-symbol:${m.summary.symbol}`, width: 16, height: 16, color: UI.white },
+    text(m.summary.text, 13, { minScale: 0.7 }), spacer()], { height: 28, gap: 7 });
 }
 function smallContent(m, p) {
   return [
@@ -483,18 +527,19 @@ function mediumContent(m, p) {
     ...(m.stale ? [updateLabel(m.fetchedAt)] : []), spacer()];
 }
 function largeContent(m, p) {
-  return [currentHeader(m, p), spacer(3), hourlyTimeline(m, p), spacer(5), separator(), spacer(6), dailyTable(m),
+  return [currentHeader(m, p), separator(), summaryRow(m), separator(), spacer(4), hourlyTimeline(m, p, true),
+    spacer(4), separator(), spacer(8), dailyTable(m),
     ...(m.stale ? [updateLabel(m.fetchedAt)] : [])];
 }
 export function renderWidget(m, family, config, refreshAt) {
   const p = profileFor(family, m.stale);
   const render = family === 'systemSmall' ? smallContent : family === 'systemLarge' ? largeContent : mediumContent;
   return { type: 'widget', padding: p.padding, gap: 0, backgroundGradient: themeFor(m), backgroundImage: skyBackground(m, family),
-    url: detailURL(config.region), refreshAfter: new Date(refreshAt).toISOString(), children: render(m, p) };
+    url: detailURL, refreshAfter: new Date(refreshAt).toISOString(), children: render(m, p) };
 }
 function messageWidget(config, family, message, refreshAt) {
   return { type: 'widget', padding: 12, backgroundGradient: themeFor({ isDay: false }),
-    refreshAfter: new Date(refreshAt).toISOString(), ...(config.region ? { url: detailURL(config.region) } : {}),
+    refreshAfter: new Date(refreshAt).toISOString(), url: detailURL,
     children: [text(config.title || config.region || '配置天气地区', 14), spacer(),
       text('—', 34), text(message, 11, { maxLines: family === 'systemSmall' ? 2 : 3, opacity: 0.85 }), spacer()] };
 }
@@ -508,11 +553,11 @@ export async function runWidget(ctx, clock = Date.now) {
   if (!validGeo(geo) || geo.at > now) { remove(ctx, 'geo'); geo = null; }
   if (!validSnapshot(snapshot, now)) { remove(ctx, 'weather'); snapshot = null; }
   if (snapshot?.current && !ageWithin(snapshot.fetchedAt, STALE_LIMIT, now)) {
-    snapshot = snapshot.failures ? { version: 1, region: config.region, failures: snapshot.failures, retryAt: snapshot.retryAt } : null;
+    snapshot = snapshot.failures ? { version: SNAPSHOT_VERSION, region: config.region, failures: snapshot.failures, retryAt: snapshot.retryAt } : null;
     if (snapshot) write(ctx, 'weather', snapshot); else remove(ctx, 'weather');
   }
   const ttl = config.refreshMinutes * MINUTE;
-  if (snapshot?.current && !snapshot.failures && ageWithin(snapshot.fetchedAt, ttl, now)) {
+  if (snapshot?.version === SNAPSHOT_VERSION && snapshot.current && !snapshot.failures && ageWithin(snapshot.fetchedAt, ttl, now)) {
     return renderWidget(viewModel(snapshot, config, geo, now), family, config, snapshot.fetchedAt + ttl);
   }
   if (snapshot?.retryAt > now) {
