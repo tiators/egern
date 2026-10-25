@@ -345,8 +345,26 @@ export function themeFor(model) {
     colors = model.twilight.phase === 'dusk' ? dusk.map((c, i) => mix(c, night[i], t))
       : ['#6B7DAB', '#AA9AB5', '#D5B7A8'].map((c, i) => mix(c, (themes[model.kind] || themes.cloud)[i], t));
   }
-  return { type: 'linear', colors,
+  return { type: 'linear', colors, stops: [0, 0.56, 1],
     startPoint: { x: 0.5, y: 0 }, endPoint: { x: 0.5, y: 1 } };
+}
+function skyBackground(m, family) {
+  const [w, h] = family === 'systemSmall' ? [164, 164] : family === 'systemLarge' ? [348, 366] : [348, 164];
+  const gradient = themeFor(m);
+  const stops = gradient.colors.map((color, i) => `<stop offset='${gradient.stops[i]}' stop-color='${color}'/>`).join('');
+  const twilight = m.twilight && ['clear', 'partly', 'cloud', 'fog', 'haze'].includes(m.kind);
+  const horizon = twilight ? '#F6D2B7' : m.isDay ? '#D9EAF4' : '#B8CDE9';
+  // 只绘制静态天色与柔和光照；系统圆角和材质仍交给 Egern / iOS。
+  return svgData(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 ${w} ${h}'>
+<defs>
+<linearGradient id='sky' x1='0' y1='0' x2='0' y2='1'>${stops}</linearGradient>
+<radialGradient id='air'><stop stop-color='#FFFFFF' stop-opacity='${m.isDay ? 0.07 : 0.035}'/><stop offset='1' stop-color='#FFFFFF' stop-opacity='0'/></radialGradient>
+<radialGradient id='horizon'><stop stop-color='${horizon}' stop-opacity='${twilight ? 0.15 : 0.045}'/><stop offset='1' stop-color='${horizon}' stop-opacity='0'/></radialGradient>
+</defs>
+<rect width='${w}' height='${h}' fill='url(#sky)'/>
+<ellipse cx='${w * 0.2}' cy='0' rx='${w * 0.9}' ry='${h * 0.8}' fill='url(#air)'/>
+<ellipse cx='${w * 0.62}' cy='${h * 1.04}' rx='${w * 0.85}' ry='${h * 0.65}' fill='url(#horizon)'/>
+</svg>`);
 }
 export function rangeURI(day, days, current) {
   const values = days.flatMap(d => [d.low, d.high]).filter(finite);
@@ -361,14 +379,35 @@ export function rangeURI(day, days, current) {
   return svgData(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 10'>${body}</svg>`);
 }
 
-// ---------- 原生布局：紧凑基准 141x141 / 292x141 / 292x311 pt ----------
+// ---------- UI：以用户当前实机截图为基准，三尺寸共用排版组件 ----------
+const UI = Object.freeze({
+  white: '#FFFFFF', secondary: 0.82, muted: 0.65,
+  small: { padding: [7, 16, 7, 16], title: 15, temperature: 44, condition: 12, range: 21, rangeWidth: 108 },
+  medium: { padding: [0, 16, 0, 16], title: 16, temperature: 44, condition: 14, range: 26,
+    leftWidth: 120, rightWidth: 136, rangeWidth: 110, mainIconWidth: 20, mainIconHeight: 16,
+    hourLabel: 12, hourTemperature: 14, hourIconWidth: 22, hourIconHeight: 19 },
+  large: { padding: 16, title: 17, temperature: 44, condition: 14, range: 26,
+    leftWidth: 124, rightWidth: 136, rangeWidth: 116, mainIconWidth: 22, mainIconHeight: 18,
+    hourLabel: 12, hourTemperature: 14, hourIconWidth: 22, hourIconHeight: 19 },
+});
+const lineHeight = size => Math.ceil(size * 1.2);
+function profileFor(family, stale) {
+  const key = family === 'systemSmall' ? 'small' : family === 'systemLarge' ? 'large' : 'medium';
+  const p = { ...UI[key] };
+  if (!stale) return p;
+  return { ...p, title: 14, temperature: key === 'large' ? 37 : 34, condition: 11, range: key === 'small' ? 18 : 22,
+    mainIconWidth: 18, mainIconHeight: 15, hourLabel: 11, hourTemperature: 13, hourIconWidth: 20, hourIconHeight: 17 };
+}
 const text = (value, size = 12, extra = {}) => ({ type: 'text', text: String(value), font: { size, weight: 'regular' },
-  textColor: '#FFFFFF', textAlign: 'left', maxLines: 1, minScale: 0.55, ...extra });
+  textColor: UI.white, textAlign: 'left', maxLines: 1, minScale: 0.55, ...extra });
 const row = (children, extra = {}) => ({ type: 'stack', direction: 'row', alignItems: 'center', children, ...extra });
 const column = (children, extra = {}) => ({ type: 'stack', direction: 'column', alignItems: 'start', children, ...extra });
 const spacer = length => length === undefined ? { type: 'spacer' } : { type: 'spacer', length };
-const icon = (code, day, size) => ({ type: 'image', ...iconSource(code, day), width: size, height: size, resizeMode: 'contain' });
+const icon = (code, day, width, height = width) => ({ type: 'image', ...iconSource(code, day), width, height, resizeMode: 'contain' });
 const detailURL = region => `${H5}/h5?city=${encodeURIComponent(region)}`;
+const leading = (node, height) => row([node, spacer()], { height });
+const trailing = (node, height) => row([spacer(), node], { height });
+const centered = (node, height) => row([spacer(), node, spacer()], { height });
 function separator() {
   return { type: 'image', src: svgData("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 320 1'><path d='M0 .5H320' stroke='white' stroke-opacity='.18'/></svg>"), height: 1, resizeMode: 'cover' };
 }
@@ -380,22 +419,37 @@ function highLow(m, size, width) {
   const labelSize = size >= 24 ? 9 : 8;
   const pair = (word, value) => row([
     column([text('最', labelSize, { opacity: 0.9 }), text(word, labelSize, { opacity: 0.9 })], { gap: 0 }),
-    text(temperatureText(value), size, { font: { size, weight: 'light' }, minScale: 0.6 }),
+    text(temperatureText(value), size, { font: { size, weight: 'light' }, minScale: 0.5 }),
   ], { width: (width - 4) / 2, gap: 1 });
-  return row([pair('高', m.high), pair('低', m.low)], { width, height: Math.ceil(size * 1.2), gap: 4 });
+  return row([pair('高', m.high), pair('低', m.low)], { width, height: lineHeight(size), gap: 4 });
 }
-function hourlyRow(m, large) {
-  const labelSize = m.stale ? 10.5 : large ? 12 : 11.5;
-  const iconSize = m.stale ? 22 : large ? 26 : 24;
-  const tempSize = m.stale ? 12.5 : large ? 15 : 14;
-  const gap = large && !m.stale ? 1 : 0.5;
-  const height = Math.ceil(labelSize * 1.2 + iconSize + tempSize * 1.2 + gap * 2);
-  return row(m.hours.map(h => column([
-    text(h.label, labelSize, { font: { size: labelSize, weight: 'medium' }, opacity: 0.82, textAlign: 'center' }),
-    h.missing ? row([text('—', 13, { opacity: 0.5 })], { height: iconSize }) : icon(h.code, h.day, iconSize),
-    text(h.detail || temperatureText(h.temperature), h.detail ? labelSize : tempSize,
-      { font: { size: h.detail ? labelSize : tempSize, weight: 'semibold' }, textAlign: 'center' }),
-  ], { flex: 1, alignItems: 'center', gap })), { height });
+function currentHeader(m, p) {
+  const title = text(m.title, p.title, { font: { size: p.title, weight: 'medium' } });
+  const temperature = text(temperatureText(m.temperature), p.temperature, { font: { size: p.temperature, weight: 'light' } });
+  const left = column([leading(title, lineHeight(p.title)), leading(temperature, lineHeight(p.temperature))], { width: p.leftWidth });
+  const rangeWidth = Math.max(temperatureText(m.high).length, temperatureText(m.low).length) > 4 ? p.rightWidth : p.rangeWidth;
+  const right = column([
+    trailing(icon(m.code, m.isDay, p.mainIconWidth, p.mainIconHeight), p.mainIconHeight + 2),
+    trailing(text(m.label, p.condition), lineHeight(p.condition)),
+    highLow(m, p.range, rangeWidth),
+  ], { width: p.rightWidth, alignItems: 'end', gap: 0.5 });
+  const height = Math.max(lineHeight(p.title) + lineHeight(p.temperature),
+    p.mainIconHeight + 2 + lineHeight(p.condition) + lineHeight(p.range) + 1);
+  // 使用固定宽度、内部首尾 spacer；不让 flex frame 改变内容的实际对齐。
+  return row([left, spacer(), right], { height, alignItems: 'start' });
+}
+function hourlyTimeline(m, p) {
+  const labelHeight = lineHeight(p.hourLabel), temperatureHeight = lineHeight(p.hourTemperature);
+  const height = labelHeight + 4 + p.hourIconHeight + 3 + temperatureHeight;
+  const slots = Array.from({ length: 6 }, (_, i) => m.hours[i] || { label: '—', missing: true, temperature: null });
+  return row(slots.map(h => column([
+    centered(text(h.label, p.hourLabel, { font: { size: p.hourLabel, weight: 'medium' }, opacity: UI.secondary, textAlign: 'center' }), labelHeight),
+    spacer(4),
+    h.missing ? centered(text('—', 13, { opacity: 0.5 }), p.hourIconHeight) : icon(h.code, h.day, p.hourIconWidth, p.hourIconHeight),
+    spacer(3),
+    centered(text(h.detail || temperatureText(h.temperature), h.detail ? p.hourLabel : p.hourTemperature,
+      { font: { size: h.detail ? p.hourLabel : p.hourTemperature, weight: 'medium' }, textAlign: 'center' }), temperatureHeight),
+  ], { flex: 1, alignItems: 'center' })), { height });
 }
 function cell(value, width, opacity = 1, align = 'end') {
   return column([text(value, 12, { opacity, textAlign: align === 'end' ? 'right' : 'left' })], { width, alignItems: align });
@@ -404,8 +458,8 @@ function dailyTable(m) {
   const children = [];
   m.days.forEach((d, i) => {
     children.push(row([
-      cell(d.label, 28, 1, 'start'), d.missing ? cell('—', 20, 0.5, 'center') : icon(d.code, true, 20),
-      cell(temperatureText(d.low), 31, 0.65),
+      cell(d.label, 28, 1, 'start'), d.missing ? cell('—', 20, 0.5, 'center') : icon(d.code, true, 20, 17),
+      cell(temperatureText(d.low), 31, UI.muted),
       { type: 'image', src: rangeURI(d, m.days, !m.stale && i === 0 ? m.temperature : null), height: 9, flex: 1, resizeMode: 'contain' },
       cell(temperatureText(d.high), 31),
     ], { height: 24, gap: 5 }));
@@ -413,46 +467,30 @@ function dailyTable(m) {
   });
   return column(children, { flex: 1 });
 }
-export function renderWidget(m, family, config, refreshAt) {
-  const small = family === 'systemSmall', large = family === 'systemLarge';
-  const root = { type: 'widget', padding: large ? 16 : small ? [8, 14, 8, 14] : [6, 16, 6, 16], gap: 0, backgroundGradient: themeFor(m),
-    url: detailURL(config.region), refreshAfter: new Date(refreshAt).toISOString(), children: [] };
-  if (small) {
-    const size = m.stale ? 34 : 42;
-    root.children = [row([text(m.title, 14, { font: { size: 14, weight: 'medium' } }), spacer()], { height: 17 }),
-      row([text(temperatureText(m.temperature), size, { font: { size, weight: 'light' } }), spacer()], { height: m.stale ? 41 : 51 }),
-      spacer(), row([icon(m.code, m.isDay, m.stale ? 16 : 18), spacer()], { height: m.stale ? 16 : 18 }),
-      row([text(m.label, m.stale ? 11 : 12), spacer()], { height: m.stale ? 14 : 15 }),
-      highLow(m, m.stale ? 18 : 20, 112), ...(m.stale ? [updateLabel(m.fetchedAt)] : [])];
-    return root;
-  }
-  const titleSize = m.stale ? 14 : large ? 17 : 15, tempSize = m.stale ? (large ? 37 : 33) : large ? 44 : 42;
-  const symbolSize = m.stale ? (large ? 20 : 18) : large ? 24 : 22;
-  const conditionSize = m.stale ? (large ? 12 : 11) : large ? 14 : 13;
-  const rangeSize = m.stale ? (large ? 22 : 20) : large ? 26 : 24;
-  const rightWidth = large ? 136 : 124;
-  const headerHeight = Math.ceil(Math.max((titleSize + tempSize) * 1.2,
-    symbolSize + conditionSize * 1.2 + Math.ceil(rangeSize * 1.2) + 2));
-  // 两侧内容有明确宽度，左侧每行用尾部 spacer 占满，避免原生 frame 把内容居中。
-  const header = row([
-    column([
-      row([text(m.title, titleSize, { font: { size: titleSize, weight: 'medium' } }), spacer()]),
-      row([text(temperatureText(m.temperature), tempSize, { font: { size: tempSize, weight: 'light' } }), spacer()]),
-    ], { width: large ? 124 : 116, alignItems: 'start' }),
+function smallContent(m, p) {
+  return [
+    leading(text(m.title, p.title, { font: { size: p.title, weight: 'medium' } }), lineHeight(p.title)),
+    leading(text(temperatureText(m.temperature), p.temperature, { font: { size: p.temperature, weight: 'light' } }), lineHeight(p.temperature)),
     spacer(),
-    column([
-      row([spacer(), icon(m.code, m.isDay, symbolSize)], { height: symbolSize }),
-      row([spacer(), text(m.label, conditionSize)], { height: conditionSize * 1.2 }),
-      highLow(m, rangeSize, rightWidth - 12),
-    ], { width: rightWidth, alignItems: 'end', gap: 1 }),
-  ], { height: headerHeight, alignItems: 'start' });
-  // 中尺寸把整组内容垂直居中；不在当前天气和小时预报之间留下弹性空洞。
-  if (!large) root.children.push(spacer());
-  root.children.push(header, spacer(2), hourlyRow(m, large));
-  if (large) root.children.push(spacer(5), separator(), spacer(6), dailyTable(m));
-  if (m.stale) root.children.push(updateLabel(m.fetchedAt));
-  if (!large) root.children.push(spacer());
-  return root;
+    leading(icon(m.code, m.isDay, 18, 14), 14),
+    leading(text(m.label, p.condition), lineHeight(p.condition)),
+    highLow(m, p.range, p.rangeWidth),
+    ...(m.stale ? [updateLabel(m.fetchedAt)] : []),
+  ];
+}
+function mediumContent(m, p) {
+  return [spacer(), currentHeader(m, p), spacer(3), hourlyTimeline(m, p),
+    ...(m.stale ? [updateLabel(m.fetchedAt)] : []), spacer()];
+}
+function largeContent(m, p) {
+  return [currentHeader(m, p), spacer(3), hourlyTimeline(m, p), spacer(5), separator(), spacer(6), dailyTable(m),
+    ...(m.stale ? [updateLabel(m.fetchedAt)] : [])];
+}
+export function renderWidget(m, family, config, refreshAt) {
+  const p = profileFor(family, m.stale);
+  const render = family === 'systemSmall' ? smallContent : family === 'systemLarge' ? largeContent : mediumContent;
+  return { type: 'widget', padding: p.padding, gap: 0, backgroundGradient: themeFor(m), backgroundImage: skyBackground(m, family),
+    url: detailURL(config.region), refreshAfter: new Date(refreshAt).toISOString(), children: render(m, p) };
 }
 function messageWidget(config, family, message, refreshAt) {
   return { type: 'widget', padding: 12, backgroundGradient: themeFor({ isDay: false }),
