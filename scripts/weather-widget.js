@@ -303,7 +303,7 @@ export function rangeURI(day, days, current) {
 
 // ---------- 原生布局：紧凑基准 141x141 / 292x141 / 292x311 pt ----------
 const text = (value, size = 12, extra = {}) => ({ type: 'text', text: String(value), font: { size, weight: 'regular' },
-  textColor: '#FFFFFF', maxLines: 1, minScale: 0.55, ...extra });
+  textColor: '#FFFFFF', textAlign: 'left', maxLines: 1, minScale: 0.55, ...extra });
 const row = (children, extra = {}) => ({ type: 'stack', direction: 'row', alignItems: 'center', children, ...extra });
 const column = (children, extra = {}) => ({ type: 'stack', direction: 'column', alignItems: 'start', children, ...extra });
 const spacer = length => length === undefined ? { type: 'spacer' } : { type: 'spacer', length };
@@ -314,7 +314,7 @@ function separator() {
 }
 function updateLabel(at) {
   return row([text('上次更新', 9, { opacity: 0.8 }), { type: 'date', date: new Date(at).toISOString(), format: 'relative',
-    font: { size: 9 }, textColor: '#FFFFFFCC', maxLines: 1, minScale: 0.5, flex: 1 }], { gap: 3, height: 12 });
+    font: { size: 9 }, textColor: '#FFFFFFCC', textAlign: 'left', maxLines: 1, minScale: 0.5 }, spacer()], { gap: 3, height: 12 });
 }
 function highLow(m, size = 10) { return text(`最高 ${temperatureText(m.high)}  最低 ${temperatureText(m.low)}`, size, { opacity: 0.85 }); }
 function hourlyRow(m, large) {
@@ -346,19 +346,23 @@ export function renderWidget(m, family, config, refreshAt) {
     url: detailURL(config.region), refreshAfter: new Date(refreshAt).toISOString(), children: [] };
   if (small) {
     const size = m.stale ? 36 : 44;
-    root.children = [row([text(m.title, 14, { font: { size: 14, weight: 'medium' }, flex: 1 })], { height: 18 }),
-      row([text(temperatureText(m.temperature), size, { font: { size, weight: 'light' }, flex: 1 })], { height: m.stale ? 44 : 53 }),
-      spacer(), row([icon(m.code, m.isDay, 19), text(m.label, 11, { flex: 1 })], { gap: 4, height: 20 }),
-      row([highLow(m)], { height: 15 }), ...(m.stale ? [updateLabel(m.fetchedAt)] : [])];
+    root.children = [row([text(m.title, 14, { font: { size: 14, weight: 'medium' } }), spacer()], { height: 18 }),
+      row([text(temperatureText(m.temperature), size, { font: { size, weight: 'light' } }), spacer()], { height: m.stale ? 44 : 53 }),
+      spacer(), row([icon(m.code, m.isDay, 19), text(m.label, 11), spacer()], { gap: 4, height: 20 }),
+      row([highLow(m), spacer()], { height: 15 }), ...(m.stale ? [updateLabel(m.fetchedAt)] : [])];
     return root;
   }
-  const titleSize = large ? 17 : 14, tempSize = large ? (m.stale ? 41 : 43) : m.stale ? 30 : 36;
+  const titleSize = large ? 17 : 14, tempSize = large ? (m.stale ? 37 : 42) : m.stale ? 29 : 39;
+  // 实机中 flex 包裹的纵向容器可能把自然宽度内容居中。
+  // 标题、温度直接置于横向行首；只让中间 spacer 分配剩余宽度。
   root.children.push(row([
-    column([text(m.title, titleSize, { font: { size: titleSize, weight: 'medium' } }),
-      text(temperatureText(m.temperature), tempSize, { font: { size: tempSize, weight: 'light' } })], { flex: 1 }),
-    column([row([icon(m.code, m.isDay, large ? 25 : 20), text(m.label, large ? 12 : 10)], { gap: 4 }),
-      highLow(m, large ? 11 : 10)], { alignItems: 'end', gap: 4 }),
-  ], { height: large ? (m.stale ? 70 : 75) : m.stale ? 53 : 61, gap: 8, alignItems: 'start' }));
+    text(m.title, titleSize, { font: { size: titleSize, weight: 'medium' } }), spacer(),
+    row([icon(m.code, m.isDay, large ? 25 : 20), text(m.label, large ? 12 : 10)], { gap: 4 }),
+  ], { height: large ? 26 : 20, gap: 6, alignItems: 'center' }));
+  root.children.push(row([
+    text(temperatureText(m.temperature), tempSize, { font: { size: tempSize, weight: 'light' } }),
+    spacer(), highLow(m, large ? 11 : 10),
+  ], { height: large ? (m.stale ? 45 : 51) : m.stale ? 35 : 47, gap: 6, alignItems: 'start' }));
   if (!large) root.children.push(spacer());
   root.children.push(spacer(large ? 5 : 2), separator(), spacer(large ? 5 : 2), hourlyRow(m, large));
   if (large) root.children.push(spacer(5), separator(), spacer(6), dailyTable(m));
