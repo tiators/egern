@@ -1,4 +1,4 @@
-name: 彩云天气
+name: 天气
 description: 查看指定地区的当前天气、小时及五日预报。
 icon: cloud.sun.fill
 env_schema:
@@ -16,10 +16,9 @@ env_schema:
     options: ["15", "30", "60"]
 scriptings:
   - generic:
-      name: caiyun-weather
-      # Egern 内部文件名，不是仓库相对路径；复制 scripts/weather-widget.js 创建此文件。
-      script_url: weather-widget.js
+      name: weather
+      script_url: https://raw.githubusercontent.com/tiators/egern/refs/heads/main/scripts/weather-widget.js
       timeout: 30
 widgets:
-  - name: 彩云天气
-    script_name: caiyun-weather
+  - name: 天气
+    script_name: weather

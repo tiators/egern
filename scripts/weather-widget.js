@@ -1,4 +1,4 @@
-/** 彩云天气 · Egern generic Widget · v1.0.0
+/** 天气 · Egern generic Widget · v1.0.0
  * 独立 ES module，无运行依赖。设置 REGION 即可使用。
  * 持久化仅两个固定键，总预算 4 KiB；ticket 仅存在于本次执行内存。
  */
