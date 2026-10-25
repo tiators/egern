@@ -232,13 +232,44 @@ export function condition(code) {
   const [label, kind] = known[code] || ['天气未知', 'unknown'];
   return { label, kind };
 }
+function localTimeAt(date, minute, meta) {
+  if (!isDate(date) || !finite(minute) || minute < 0 || minute >= 1440) return null;
+  const wall = Date.parse(`${date}T00:00:00Z`) + minute * MINUTE;
+  let at = wall - meta.shift * 1000;
+  // 从地区墙上时间反解时间戳；跨夏令时切换时不能直接加到当前时刻。
+  for (let i = 0; i < 4; i++) {
+    const p = localParts(at, meta);
+    const actual = Date.parse(`${p.date}T00:00:00Z`) + (p.hour * 60 + p.minute) * MINUTE + p.second * 1000;
+    if (actual === wall) return at;
+    at += wall - actual;
+  }
+  return null;
+}
+function withSolarEvents(hours, s, now, stale) {
+  if (stale) return hours;
+  const end = hours[hours.length - 1].at;
+  const events = [];
+  for (const a of s.astro) for (const [field, code, detail] of [['rise', 'SUNRISE', '日出'], ['set', 'SUNSET', '日落']]) {
+    const at = localTimeAt(a.date, a[field], s);
+    if (at === null || at <= now || at > end) continue;
+    const p = localParts(at, s);
+    events.push({ at, code, detail, temperature: null, day: true,
+      label: `${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')}` });
+  }
+  if (!events.length) return hours;
+  // 整点前即将日出/日落时，用事件替换“现在”；其余事件按时间插入。
+  const imminent = events.some(e => e.at <= hours[1].at);
+  const occupied = new Set(events.map(e => e.at));
+  return [...hours.filter((h, i) => !(imminent && i === 0) && !occupied.has(h.at)), ...events]
+    .sort((a, b) => a.at - b.at).slice(0, 6);
+}
 export function viewModel(s, config, geo, now, stale = false) {
   const today = localParts(now, s).date, currentDay = s.days.find(d => d.date === today);
   const floor = hourFloor(now, s), byHour = new Map(s.hours.map(h => [h.at, h]));
-  const hours = [{ ...s.current, label: stale ? '上次' : '现在', day: daytime(stale ? s.fetchedAt : now, s, s.current.code) }];
+  const hours = [{ ...s.current, at: now, label: stale ? '上次' : '现在', day: daytime(stale ? s.fetchedAt : now, s, s.current.code) }];
   for (let i = 1; i <= 5; i++) {
     const at = floor + i * HOUR, h = byHour.get(at);
-    hours.push({ temperature: h?.temperature ?? null, code: h?.code || 'UNKNOWN',
+    hours.push({ at, temperature: h?.temperature ?? null, code: h?.code || 'UNKNOWN',
       label: `${localParts(at, s).hour}时`, day: daytime(at, s, h?.code || ''), missing: !h });
   }
   const days = Array.from({ length: 5 }, (_, i) => {
@@ -247,7 +278,7 @@ export function viewModel(s, config, geo, now, stale = false) {
     return { date, label, low: d?.low ?? null, high: d?.high ?? null, code: d?.code || 'UNKNOWN', missing: !d };
   });
   return { title: config.title || geo?.name || config.region, ...s.current, ...condition(s.current.code),
-    low: currentDay?.low ?? null, high: currentDay?.high ?? null, hours, days,
+    low: currentDay?.low ?? null, high: currentDay?.high ?? null, hours: withSolarEvents(hours, s, now, stale), days,
     isDay: daytime(now, s, s.current.code), stale, fetchedAt: s.fetchedAt };
 }
 
@@ -265,9 +296,14 @@ function svgData(markup) {
 }
 const CLOUD = "<path d='M16 35C8 35 5 30 5 25S9 15 15 15C18 7 28 5 35 9C39 11 41 14 42 18C50 16 58 21 58 27C58 32 54 35 48 35Z' fill='#F3F7FC'/>";
 export function iconSource(code, day) {
+  if (code === 'SUNRISE' || code === 'SUNSET') {
+    const arrow = code === 'SUNRISE' ? 'M32 16V3M27 8l5-5 5 5' : 'M32 3v13M27 11l5 5 5-5';
+    return { src: svgData(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 56'><path d='M16 40a16 16 0 0 1 32 0' fill='#FFD65A'/><path d='M9 32l-5-2M17 23l-4-5M47 23l4-5M55 32l5-2' stroke='#FFD65A' stroke-width='3' stroke-linecap='round'/><path d='M5 41h54M12 48h40' stroke='#F7FAFF' stroke-width='3' stroke-linecap='round'/><path d='${arrow}' fill='none' stroke='#F7FAFF' stroke-width='2.8' stroke-linecap='round' stroke-linejoin='round'/></svg>`) };
+  }
   const { kind } = condition(code);
   if (kind === 'clear') return { src: `sf-symbol:${day ? 'sun.max.fill' : 'moon.fill'}`, color: day ? '#FFD879' : '#FFF3C8' };
   if (kind === 'cloud') return { src: 'sf-symbol:cloud.fill', color: '#F3F7FC' };
+  if (kind === 'fog' || kind === 'haze') return { src: 'sf-symbol:cloud.fog.fill', color: '#F3F7FC' };
   if (kind === 'wind') return { src: 'sf-symbol:wind', color: '#F3F7FC' };
   if (kind === 'unknown') return { src: 'sf-symbol:questionmark', color: '#FFFFFF99' };
   let body = CLOUD;
@@ -276,17 +312,18 @@ export function iconSource(code, day) {
   if (kind === 'rain') body += "<path d='M21 41l-3 7M33 41l-3 7M45 41l-3 7' stroke='#9ED9FF' stroke-width='3' stroke-linecap='round'/>";
   if (kind === 'snow') body += "<g fill='#E2F5FF'><circle cx='20' cy='44' r='2'/><circle cx='32' cy='48' r='2'/><circle cx='44' cy='43' r='2'/></g>";
   if (kind === 'storm') body += "<path d='M34 34L23 47h9l-5 9 18-17h-10l5-5Z' fill='#FFD879'/>";
-  if (kind === 'fog' || kind === 'haze') body += `<path d='M10 43h44M16 50h34' stroke='${kind === 'haze' ? '#E6D6B1' : '#DDE6EC'}' stroke-width='3' stroke-linecap='round'/>`;
   return { src: svgData(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 56'>${body}</svg>`) };
 }
 export function themeFor(model) {
   const themes = {
-    clear: ['#1962AB', '#438FD0'], partly: ['#2D679A', '#79A3C3'], cloud: ['#435D76', '#8198AB'],
-    rain: ['#29465F', '#64859D'], snow: ['#526F88', '#91AABB'], fog: ['#566B7B', '#8FA0AC'],
-    haze: ['#665F58', '#A19784'], storm: ['#29354C', '#5C708A'], wind: ['#34566E', '#829FB3'],
+    clear: ['#2469A8', '#528DB8', '#88ADBF'], partly: ['#4C779D', '#6E92AD', '#8DA8B8'],
+    cloud: ['#7B8998', '#6B7889', '#596A7C'], rain: ['#526A82', '#425970', '#354B63'],
+    snow: ['#879BAA', '#758C9E', '#647F94'], fog: ['#87949E', '#74838F', '#627584'],
+    haze: ['#7D8995', '#707C89', '#616E7C'], storm: ['#4D5D73', '#394D66', '#293C55'],
+    wind: ['#638198', '#54758E', '#42647E'],
   };
-  return { type: 'linear', colors: model.isDay ? themes[model.kind] || themes.cloud : ['#12213D', '#344E72'],
-    startPoint: { x: 0, y: 0 }, endPoint: { x: 0.65, y: 1 } };
+  return { type: 'linear', colors: model.isDay ? themes[model.kind] || themes.cloud : ['#17263F', '#2D405B', '#42556D'],
+    startPoint: { x: 0.5, y: 0 }, endPoint: { x: 0.5, y: 1 } };
 }
 export function rangeURI(day, days, current) {
   const values = days.flatMap(d => [d.low, d.high]).filter(finite);
@@ -316,13 +353,26 @@ function updateLabel(at) {
   return row([text('上次更新', 9, { opacity: 0.8 }), { type: 'date', date: new Date(at).toISOString(), format: 'relative',
     font: { size: 9 }, textColor: '#FFFFFFCC', textAlign: 'left', maxLines: 1, minScale: 0.5 }, spacer()], { gap: 3, height: 12 });
 }
-function highLow(m, size = 10) { return text(`最高 ${temperatureText(m.high)}  最低 ${temperatureText(m.low)}`, size, { opacity: 0.85 }); }
+function highLow(m, size, width) {
+  const labelSize = size >= 24 ? 9 : 8;
+  const pair = (word, value) => row([
+    column([text('最', labelSize, { opacity: 0.9 }), text(word, labelSize, { opacity: 0.9 })], { gap: 0 }),
+    text(temperatureText(value), size, { font: { size, weight: 'light' }, minScale: 0.6 }),
+  ], { width: (width - 4) / 2, gap: 1 });
+  return row([pair('高', m.high), pair('低', m.low)], { width, height: Math.ceil(size * 1.2), gap: 4 });
+}
 function hourlyRow(m, large) {
+  const labelSize = m.stale ? 10.5 : large ? 12 : 11.5;
+  const iconSize = m.stale ? 22 : large ? 26 : 24;
+  const tempSize = m.stale ? 12.5 : large ? 15 : 14;
+  const gap = large && !m.stale ? 1 : 0.5;
+  const height = Math.ceil(labelSize * 1.2 + iconSize + tempSize * 1.2 + gap * 2);
   return row(m.hours.map(h => column([
-    text(h.label, large ? 11 : 9, { opacity: 0.78, textAlign: 'center' }),
-    h.missing ? row([text('—', 13, { opacity: 0.5 })], { height: large ? 19 : 16 }) : icon(h.code, h.day, large ? 19 : 16),
-    text(temperatureText(h.temperature), large ? 13 : 12, { textAlign: 'center' }),
-  ], { flex: 1, alignItems: 'center', gap: 1 })), { height: large ? 51 : 44 });
+    text(h.label, labelSize, { font: { size: labelSize, weight: 'medium' }, opacity: 0.82, textAlign: 'center' }),
+    h.missing ? row([text('—', 13, { opacity: 0.5 })], { height: iconSize }) : icon(h.code, h.day, iconSize),
+    text(h.detail || temperatureText(h.temperature), h.detail ? labelSize : tempSize,
+      { font: { size: h.detail ? labelSize : tempSize, weight: 'semibold' }, textAlign: 'center' }),
+  ], { flex: 1, alignItems: 'center', gap })), { height });
 }
 function cell(value, width, opacity = 1, align = 'end') {
   return column([text(value, 12, { opacity, textAlign: align === 'end' ? 'right' : 'left' })], { width, alignItems: align });
@@ -342,31 +392,43 @@ function dailyTable(m) {
 }
 export function renderWidget(m, family, config, refreshAt) {
   const small = family === 'systemSmall', large = family === 'systemLarge';
-  const root = { type: 'widget', padding: large ? 16 : 12, gap: 0, backgroundGradient: themeFor(m),
+  const root = { type: 'widget', padding: large ? 16 : small ? [8, 14, 8, 14] : [6, 16, 6, 16], gap: 0, backgroundGradient: themeFor(m),
     url: detailURL(config.region), refreshAfter: new Date(refreshAt).toISOString(), children: [] };
   if (small) {
-    const size = m.stale ? 36 : 44;
+    const size = m.stale ? 34 : 42;
     root.children = [row([text(m.title, 14, { font: { size: 14, weight: 'medium' } }), spacer()], { height: 18 }),
-      row([text(temperatureText(m.temperature), size, { font: { size, weight: 'light' } }), spacer()], { height: m.stale ? 44 : 53 }),
-      spacer(), row([icon(m.code, m.isDay, 19), text(m.label, 11), spacer()], { gap: 4, height: 20 }),
-      row([highLow(m), spacer()], { height: 15 }), ...(m.stale ? [updateLabel(m.fetchedAt)] : [])];
+      row([text(temperatureText(m.temperature), size, { font: { size, weight: 'light' } }), spacer()], { height: m.stale ? 41 : 51 }),
+      spacer(), row([icon(m.code, m.isDay, m.stale ? 16 : 18), spacer()], { height: m.stale ? 16 : 18 }),
+      row([text(m.label, m.stale ? 11 : 12), spacer()], { height: m.stale ? 14 : 15 }),
+      highLow(m, m.stale ? 18 : 20, 112), ...(m.stale ? [updateLabel(m.fetchedAt)] : [])];
     return root;
   }
-  const titleSize = large ? 17 : 14, tempSize = large ? (m.stale ? 37 : 42) : m.stale ? 29 : 39;
-  // 实机中 flex 包裹的纵向容器可能把自然宽度内容居中。
-  // 标题、温度直接置于横向行首；只让中间 spacer 分配剩余宽度。
-  root.children.push(row([
-    text(m.title, titleSize, { font: { size: titleSize, weight: 'medium' } }), spacer(),
-    row([icon(m.code, m.isDay, large ? 25 : 20), text(m.label, large ? 12 : 10)], { gap: 4 }),
-  ], { height: large ? 26 : 20, gap: 6, alignItems: 'center' }));
-  root.children.push(row([
-    text(temperatureText(m.temperature), tempSize, { font: { size: tempSize, weight: 'light' } }),
-    spacer(), highLow(m, large ? 11 : 10),
-  ], { height: large ? (m.stale ? 45 : 51) : m.stale ? 35 : 47, gap: 6, alignItems: 'start' }));
+  const titleSize = m.stale ? 14 : large ? 17 : 15, tempSize = m.stale ? (large ? 37 : 33) : large ? 44 : 42;
+  const symbolSize = m.stale ? (large ? 20 : 18) : large ? 24 : 22;
+  const conditionSize = m.stale ? (large ? 12 : 11) : large ? 14 : 13;
+  const rangeSize = m.stale ? (large ? 22 : 20) : large ? 26 : 24;
+  const rightWidth = large ? 136 : 124;
+  const headerHeight = Math.ceil(Math.max((titleSize + tempSize) * 1.2,
+    symbolSize + conditionSize * 1.2 + Math.ceil(rangeSize * 1.2) + 2));
+  // 两侧内容有明确宽度，左侧每行用尾部 spacer 占满，避免原生 frame 把内容居中。
+  const header = row([
+    column([
+      row([text(m.title, titleSize, { font: { size: titleSize, weight: 'medium' } }), spacer()]),
+      row([text(temperatureText(m.temperature), tempSize, { font: { size: tempSize, weight: 'light' } }), spacer()]),
+    ], { width: large ? 124 : 116, alignItems: 'start' }),
+    spacer(),
+    column([
+      row([spacer(), icon(m.code, m.isDay, symbolSize)], { height: symbolSize }),
+      row([spacer(), text(m.label, conditionSize)], { height: conditionSize * 1.2 }),
+      highLow(m, rangeSize, rightWidth),
+    ], { width: rightWidth, alignItems: 'end', gap: 1 }),
+  ], { height: headerHeight, alignItems: 'start' });
+  // 中尺寸把整组内容垂直居中；不在当前天气和小时预报之间留下弹性空洞。
   if (!large) root.children.push(spacer());
-  root.children.push(spacer(large ? 5 : 2), separator(), spacer(large ? 5 : 2), hourlyRow(m, large));
+  root.children.push(header, spacer(2), hourlyRow(m, large));
   if (large) root.children.push(spacer(5), separator(), spacer(6), dailyTable(m));
   if (m.stale) root.children.push(updateLabel(m.fetchedAt));
+  if (!large) root.children.push(spacer());
   return root;
 }
 function messageWidget(config, family, message, refreshAt) {
