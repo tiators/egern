@@ -423,11 +423,12 @@ function updateLabel(at) {
   return row([text('上次更新', 9, { opacity: 0.8 }), { type: 'date', date: new Date(at).toISOString(), format: 'relative',
     font: { size: 9 }, textColor: '#FFFFFFCC', textAlign: 'left', maxLines: 1, minScale: 0.5 }, spacer()], { gap: 3, height: 12 });
 }
-function highLow(m, size, width) {
+function highLow(m, size, width, rightAligned = false) {
   const labelSize = size >= 24 ? 9 : 8;
   const pair = (word, value) => row([
+    ...(rightAligned ? [spacer()] : []),
     column([text('最', labelSize, { opacity: 0.9 }), text(word, labelSize, { opacity: 0.9 })], { gap: 0 }),
-    text(temperatureText(value), size, { font: { size, weight: 'light' }, minScale: 0.5 }),
+    text(temperatureText(value), size, { font: { size, weight: 'light' }, textAlign: rightAligned ? 'right' : 'left', minScale: 0.5 }),
   ], { width: (width - 4) / 2, gap: 1 });
   return row([pair('高', m.high), pair('低', m.low)], { width, height: lineHeight(size), gap: 4 });
 }
@@ -441,7 +442,8 @@ function currentHeader(m, p, hideMissingRange = false) {
     p.mainIconHeight + 2 + lineHeight(p.condition) + (showRange ? lineHeight(p.range) + 1 : 0));
   const symbol = trailing(icon(m.code, m.isDay, p.mainIconWidth, p.mainIconHeight), p.mainIconHeight + 2);
   const description = trailing(text(m.label, p.condition), lineHeight(p.condition));
-  const right = column(showRange ? [symbol, description, highLow(m, p.range, rangeWidth)] : [symbol, spacer(), description],
+  const range = trailing(highLow(m, p.range, rangeWidth, true), lineHeight(p.range));
+  const right = column(showRange ? [symbol, description, range] : [symbol, spacer(), description],
     { width: p.rightWidth, alignItems: 'end', ...(showRange ? { gap: 0.5 } : { height }) });
   // 使用固定宽度、内部首尾 spacer；不让 flex frame 改变内容的实际对齐。
   return row([left, spacer(), right], { height, alignItems: 'start' });
