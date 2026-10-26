@@ -84,6 +84,7 @@ function validSnapshot(s, now) {
     && onlyKeys(s.current, ['temperature', 'code']) && finite(s.current?.temperature) && typeof s.current?.code === 'string'
     && Array.isArray(s.hours) && s.hours.length <= 7
     && s.hours.every(h => onlyKeys(h, ['at', 'temperature', 'code']) && finite(h.at) && nullable(h.temperature) && typeof h.code === 'string')
+    // 兼容旧版“今天起五天”快照；新写入仅保留明天起四天。
     && Array.isArray(s.days) && s.days.length <= 5
     && s.days.every(d => onlyKeys(d, ['date', 'low', 'high', 'code']) && isDate(d.date) && nullable(d.low) && nullable(d.high) && typeof d.code === 'string')
     && Array.isArray(s.astro) && s.astro.length <= 2
@@ -198,7 +199,7 @@ export function normalizeWeather(data, region, now) {
     if (ht.has(at) || hs.has(at)) snapshot.hours.push({ at, temperature: numeric(ht.get(at)?.value), code: codeOf(hs.get(at)?.value) });
   }
   const dt = rows(daily.temperature, 'date', false), ds = rows(daily.skycon, 'date', false), da = rows(daily.astro, 'date', false);
-  for (let i = 0; i < 5; i++) {
+  for (let i = 1; i <= 4; i++) {
     const date = nextDate(today, i);
     if (dt.has(date) || ds.has(date)) {
       const t = dt.get(date);
@@ -206,7 +207,11 @@ export function normalizeWeather(data, region, now) {
       if (low !== null && high !== null && low > high) low = high = null;
       snapshot.days.push({ date, low, high, code: codeOf(ds.get(date)?.value) });
     }
-    if (i < 2 && da.has(date)) {
+  }
+  // 天文数据与逐日温度分别裁剪，仍保留今明两天以判断昼夜和暮光。
+  for (let i = 0; i < 2; i++) {
+    const date = nextDate(today, i);
+    if (da.has(date)) {
       const a = da.get(date);
       snapshot.astro.push({ date, rise: minutes(a?.sunrise?.time), set: minutes(a?.sunset?.time) });
     }
@@ -215,7 +220,7 @@ export function normalizeWeather(data, region, now) {
 }
 function prune(s, now) {
   const today = localParts(now, s).date;
-  return { ...s, hours: s.hours.filter(h => h.at > now), days: s.days.filter(d => d.date >= today), astro: s.astro.filter(a => a.date >= today) };
+  return { ...s, hours: s.hours.filter(h => h.at > now), days: s.days.filter(d => d.date > today), astro: s.astro.filter(a => a.date >= today) };
 }
 function daytime(at, snapshot, code) {
   const p = localParts(at, snapshot), a = snapshot.astro.find(a => a.date === p.date);
@@ -271,7 +276,7 @@ function forecastSummary(day) {
     symbol: ['rain', 'storm'].includes(weather.kind) ? 'umbrella.fill' : 'calendar' };
 }
 export function viewModel(s, config, geo, now, stale = false) {
-  const today = localParts(now, s).date, currentDay = s.days.find(d => d.date === today);
+  const today = localParts(now, s).date;
   const floor = hourFloor(now, s), byHour = new Map(s.hours.map(h => [h.at, h]));
   const hours = [];
   for (let i = 1; i <= 6; i++) {
@@ -279,16 +284,13 @@ export function viewModel(s, config, geo, now, stale = false) {
     hours.push({ at, temperature: h?.temperature ?? null, code: h?.code || 'UNKNOWN',
       label: `${localParts(at, s).hour}时`, day: daytime(at, s, h?.code || ''), missing: !h });
   }
-  const days = Array.from({ length: 5 }, (_, i) => {
-    const date = nextDate(today, i), d = s.days.find(d => d.date === date);
-    const label = i === 0 ? '今天' : i === 1 ? '明天' : ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(`${date}T12:00:00Z`).getUTCDay()];
+  const futureDays = Array.from({ length: 4 }, (_, i) => {
+    const date = nextDate(today, i + 1), d = s.days.find(d => d.date === date);
+    const label = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(`${date}T12:00:00Z`).getUTCDay()];
     return { date, label, low: d?.low ?? null, high: d?.high ?? null, code: d?.code || 'UNKNOWN', missing: !d };
   });
-  const futureDays = days.slice(1).map(d => ({ ...d,
-    label: ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(`${d.date}T12:00:00Z`).getUTCDay()] }));
   return { title: config.title || geo?.name || config.region, ...s.current, ...condition(s.current.code),
-    low: currentDay?.low ?? null, high: currentDay?.high ?? null, hours, days,
-    futureDays, summary: forecastSummary(futureDays[0]),
+    hours, futureDays, summary: forecastSummary(futureDays[0]),
     isDay: daytime(now, s, s.current.code), twilight: twilightAt(s, now), stale, fetchedAt: s.fetchedAt };
 }
 
@@ -389,13 +391,13 @@ export function temperatureRange(day, days) {
 
 // ---------- UI：以用户当前实机截图为基准，三尺寸共用排版组件 ----------
 const UI = Object.freeze({
-  white: '#FFFFFF', secondary: 0.82, muted: 0.65,
-  small: { padding: [7, 16, 7, 16], title: 15, temperature: 44, condition: 12, range: 21, rangeWidth: 108 },
-  medium: { padding: [0, 16, 0, 16], title: 16, temperature: 44, condition: 14, range: 26,
-    leftWidth: 120, rightWidth: 136, rangeWidth: 110, mainIconWidth: 20, mainIconHeight: 16,
+  white: '#FFFFFF', secondary: 0.82,
+  small: { padding: [7, 16, 7, 16], title: 15, temperature: 44, condition: 12 },
+  medium: { padding: [0, 16, 0, 16], title: 16, temperature: 44, condition: 14,
+    leftWidth: 120, rightWidth: 136, mainIconWidth: 20, mainIconHeight: 16,
     hourLabel: 12, hourTemperature: 14, hourIconWidth: 22, hourIconHeight: 19 },
-  large: { padding: 16, title: 17, temperature: 44, condition: 14, range: 26,
-    leftWidth: 124, rightWidth: 136, rangeWidth: 116, mainIconWidth: 22, mainIconHeight: 18,
+  large: { padding: 16, title: 17, temperature: 44, condition: 14,
+    leftWidth: 124, rightWidth: 136, mainIconWidth: 22, mainIconHeight: 18,
     hourLabel: 12, hourTemperature: 14, hourIconWidth: 22, hourIconHeight: 19 },
 });
 const lineHeight = size => Math.ceil(size * 1.2);
@@ -403,7 +405,7 @@ function profileFor(family, stale) {
   const key = family === 'systemSmall' ? 'small' : family === 'systemLarge' ? 'large' : 'medium';
   const p = { ...UI[key] };
   if (!stale) return p;
-  return { ...p, title: 14, temperature: key === 'large' ? 37 : 34, condition: 11, range: key === 'small' ? 18 : 22,
+  return { ...p, title: 14, temperature: key === 'large' ? 37 : 34, condition: 11,
     mainIconWidth: 18, mainIconHeight: 15, hourLabel: 11, hourTemperature: 13, hourIconWidth: 20, hourIconHeight: 17 };
 }
 const text = (value, size = 12, extra = {}) => ({ type: 'text', text: String(value), font: { size, weight: 'regular' },
@@ -423,28 +425,15 @@ function updateLabel(at) {
   return row([text('上次更新', 9, { opacity: 0.8 }), { type: 'date', date: new Date(at).toISOString(), format: 'relative',
     font: { size: 9 }, textColor: '#FFFFFFCC', textAlign: 'left', maxLines: 1, minScale: 0.5 }, spacer()], { gap: 3, height: 12 });
 }
-function highLow(m, size, width, rightAligned = false) {
-  const labelSize = size >= 24 ? 9 : 8;
-  const pair = (word, value) => row([
-    ...(rightAligned ? [spacer()] : []),
-    column([text('最', labelSize, { opacity: 0.9 }), text(word, labelSize, { opacity: 0.9 })], { gap: 0 }),
-    text(temperatureText(value), size, { font: { size, weight: 'light' }, textAlign: rightAligned ? 'right' : 'left', minScale: 0.5 }),
-  ], { width: (width - 4) / 2, gap: 1 });
-  return row([pair('高', m.high), pair('低', m.low)], { width, height: lineHeight(size), gap: 4 });
-}
-function currentHeader(m, p, hideMissingRange = false) {
+function currentHeader(m, p) {
   const title = text(m.title, p.title, { font: { size: p.title, weight: 'medium' } });
   const temperature = text(temperatureText(m.temperature), p.temperature, { font: { size: p.temperature, weight: 'light' } });
   const left = column([leading(title, lineHeight(p.title)), leading(temperature, lineHeight(p.temperature))], { width: p.leftWidth });
-  const rangeWidth = Math.max(temperatureText(m.high).length, temperatureText(m.low).length) > 4 ? p.rightWidth : p.rangeWidth;
-  const showRange = !hideMissingRange || finite(m.high) || finite(m.low);
   const height = Math.max(lineHeight(p.title) + lineHeight(p.temperature),
-    p.mainIconHeight + 2 + lineHeight(p.condition) + (showRange ? lineHeight(p.range) + 1 : 0));
+    p.mainIconHeight + 2 + lineHeight(p.condition));
   const symbol = trailing(icon(m.code, m.isDay, p.mainIconWidth, p.mainIconHeight), p.mainIconHeight + 2);
   const description = trailing(text(m.label, p.condition), lineHeight(p.condition));
-  const range = trailing(highLow(m, p.range, rangeWidth, true), lineHeight(p.range));
-  const right = column(showRange ? [symbol, description, range] : [symbol, spacer(), description],
-    { width: p.rightWidth, alignItems: 'end', ...(showRange ? { gap: 0.5 } : { height }) });
+  const right = column([symbol, spacer(), description], { width: p.rightWidth, height, alignItems: 'end' });
   // 使用固定宽度、内部首尾 spacer；不让 flex frame 改变内容的实际对齐。
   return row([left, spacer(), right], { height, alignItems: 'start' });
 }
@@ -503,12 +492,11 @@ function smallContent(m, p) {
     spacer(),
     leading(icon(m.code, m.isDay, 18, 14), 14),
     leading(text(m.label, p.condition), lineHeight(p.condition)),
-    highLow(m, p.range, p.rangeWidth),
     ...(m.stale ? [updateLabel(m.fetchedAt)] : []),
   ];
 }
 function mediumContent(m, p) {
-  return [spacer(), currentHeader(m, p, true), spacer(3), hourlyTimeline(m, p),
+  return [spacer(), currentHeader(m, p), spacer(3), hourlyTimeline(m, p),
     ...(m.stale ? [updateLabel(m.fetchedAt)] : []), spacer()];
 }
 function largeContent(m, p) {
