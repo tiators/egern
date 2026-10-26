@@ -248,25 +248,6 @@ function localTimeAt(date, minute, meta) {
   }
   return null;
 }
-function withSolarEvents(hours, s, now, stale) {
-  const regular = hours.slice(0, 6);
-  if (stale) return regular;
-  const end = regular[regular.length - 1].at;
-  const events = [];
-  for (const a of s.astro) for (const [field, code, detail] of [['rise', 'SUNRISE', '日出'], ['set', 'SUNSET', '日落']]) {
-    const at = localTimeAt(a.date, a[field], s);
-    if (at === null || at <= now - HOUR || at > end) continue;
-    const p = localParts(at, s);
-    events.push({ at, code, detail, temperature: null, day: true,
-      label: `${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')}` });
-  }
-  if (!events.length) return regular;
-  // 刚发生或整点前即将发生的日出/日落替换“现在”，保留明确的事件时间。
-  const imminent = events.some(e => e.at < hours[1].at);
-  const occupied = new Set(events.map(e => e.at));
-  return [...hours.filter((h, i) => !(imminent && i === 0) && !occupied.has(h.at)), ...events]
-    .sort((a, b) => a.at - b.at).slice(0, 6);
-}
 function twilightAt(s, now) {
   const date = localParts(now, s).date, astro = s.astro.find(a => a.date === date);
   if (!astro) return null;
@@ -292,7 +273,7 @@ function forecastSummary(day) {
 export function viewModel(s, config, geo, now, stale = false) {
   const today = localParts(now, s).date, currentDay = s.days.find(d => d.date === today);
   const floor = hourFloor(now, s), byHour = new Map(s.hours.map(h => [h.at, h]));
-  const hours = [{ ...s.current, at: now, label: stale ? '上次' : '现在', day: daytime(stale ? s.fetchedAt : now, s, s.current.code) }];
+  const hours = [];
   for (let i = 1; i <= 6; i++) {
     const at = floor + i * HOUR, h = byHour.get(at);
     hours.push({ at, temperature: h?.temperature ?? null, code: h?.code || 'UNKNOWN',
@@ -306,8 +287,8 @@ export function viewModel(s, config, geo, now, stale = false) {
   const futureDays = days.slice(1).map(d => ({ ...d,
     label: ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(`${d.date}T12:00:00Z`).getUTCDay()] }));
   return { title: config.title || geo?.name || config.region, ...s.current, ...condition(s.current.code),
-    low: currentDay?.low ?? null, high: currentDay?.high ?? null, hours: withSolarEvents(hours, s, now, stale), days,
-    upcomingHours: hours.slice(1, 7), futureDays, summary: forecastSummary(futureDays[0]),
+    low: currentDay?.low ?? null, high: currentDay?.high ?? null, hours, days,
+    futureDays, summary: forecastSummary(futureDays[0]),
     isDay: daytime(now, s, s.current.code), twilight: twilightAt(s, now), stale, fetchedAt: s.fetchedAt };
 }
 
@@ -325,10 +306,6 @@ function svgData(markup) {
 }
 const CLOUD = "<path d='M16 35C8 35 5 30 5 25S9 15 15 15C18 7 28 5 35 9C39 11 41 14 42 18C50 16 58 21 58 27C58 32 54 35 48 35Z' fill='#F3F7FC'/>";
 export function iconSource(code, day) {
-  if (code === 'SUNRISE' || code === 'SUNSET') {
-    const arrow = code === 'SUNRISE' ? 'M32 16V3M27 8l5-5 5 5' : 'M32 3v13M27 11l5 5 5-5';
-    return { src: svgData(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 56'><path d='M16 40a16 16 0 0 1 32 0' fill='#FFD65A'/><path d='M9 32l-5-2M17 23l-4-5M47 23l4-5M55 32l5-2' stroke='#FFD65A' stroke-width='3' stroke-linecap='round'/><path d='M5 41h54M12 48h40' stroke='#F7FAFF' stroke-width='3' stroke-linecap='round'/><path d='${arrow}' fill='none' stroke='#F7FAFF' stroke-width='2.8' stroke-linecap='round' stroke-linejoin='round'/></svg>`) };
-  }
   const { kind } = condition(code);
   if (kind === 'clear') return { src: `sf-symbol:${day ? 'sun.max.fill' : 'moon.fill'}`, color: day ? '#FFD879' : '#FFF3C8' };
   if (kind === 'cloud') return { src: 'sf-symbol:cloud.fill', color: '#F3F7FC' };
@@ -338,7 +315,13 @@ export function iconSource(code, day) {
   let body = CLOUD;
   if (kind === 'partly') body = (day ? "<circle cx='44' cy='15' r='12' fill='#FFD879'/>"
     : "<path d='M46 2C28 4 29 26 48 27C38 18 39 11 46 2Z' fill='#FFF3C8'/>") + `<g transform='translate(-2 6)'>${CLOUD}</g>`;
-  if (kind === 'rain') body += "<path d='M21 41l-3 7M33 41l-3 7M45 41l-3 7' stroke='#9ED9FF' stroke-width='3' stroke-linecap='round'/>";
+  if (kind === 'rain') {
+    if (!day && ['LIGHT_RAIN', 'MODERATE_RAIN'].includes(code)) {
+      body = "<path d='M51 2C38 3 36 18 46 24C51 27 58 25 61 21C50 23 44 10 51 2Z' fill='#F6F5ED'/>"
+        + `<g transform='translate(-1 4) scale(.9)'>${CLOUD}</g>`;
+    }
+    body += "<path d='M21 41l-3 7M33 41l-3 7M45 41l-3 7' stroke='#72D4EE' stroke-width='3' stroke-linecap='round'/>";
+  }
   if (kind === 'snow') body += "<g fill='#E2F5FF'><circle cx='20' cy='44' r='2'/><circle cx='32' cy='48' r='2'/><circle cx='44' cy='43' r='2'/></g>";
   if (kind === 'storm') body += "<path d='M34 34L23 47h9l-5 9 18-17h-10l5-5Z' fill='#FFD879'/>";
   return { src: svgData(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 56'>${body}</svg>`) };
@@ -351,7 +334,8 @@ export function themeFor(model) {
     haze: ['#7D8995', '#707C89', '#616E7C'], storm: ['#4D5D73', '#394D66', '#293C55'],
     wind: ['#638198', '#54758E', '#42647E'],
   };
-  const night = ['#201D31', '#252640', '#2B3552'];
+  const night = ['cloud', 'fog', 'haze', 'rain', 'storm'].includes(model.kind)
+    ? ['#293340', '#24303D', '#1D2937'] : ['#201D31', '#252640', '#2B3552'];
   let colors = model.isDay ? themes[model.kind] || themes.cloud : night;
   if (model.twilight && ['clear', 'partly', 'cloud', 'fog', 'haze'].includes(model.kind)) {
     const mix = (a, b, amount) => '#' + [1, 3, 5].map(i => Math.round(parseInt(a.slice(i, i + 2), 16) * (1 - amount)
@@ -447,35 +431,34 @@ function highLow(m, size, width) {
   ], { width: (width - 4) / 2, gap: 1 });
   return row([pair('高', m.high), pair('低', m.low)], { width, height: lineHeight(size), gap: 4 });
 }
-function currentHeader(m, p) {
+function currentHeader(m, p, hideMissingRange = false) {
   const title = text(m.title, p.title, { font: { size: p.title, weight: 'medium' } });
   const temperature = text(temperatureText(m.temperature), p.temperature, { font: { size: p.temperature, weight: 'light' } });
   const left = column([leading(title, lineHeight(p.title)), leading(temperature, lineHeight(p.temperature))], { width: p.leftWidth });
   const rangeWidth = Math.max(temperatureText(m.high).length, temperatureText(m.low).length) > 4 ? p.rightWidth : p.rangeWidth;
-  const right = column([
-    trailing(icon(m.code, m.isDay, p.mainIconWidth, p.mainIconHeight), p.mainIconHeight + 2),
-    trailing(text(m.label, p.condition), lineHeight(p.condition)),
-    highLow(m, p.range, rangeWidth),
-  ], { width: p.rightWidth, alignItems: 'end', gap: 0.5 });
+  const showRange = !hideMissingRange || finite(m.high) || finite(m.low);
   const height = Math.max(lineHeight(p.title) + lineHeight(p.temperature),
-    p.mainIconHeight + 2 + lineHeight(p.condition) + lineHeight(p.range) + 1);
+    p.mainIconHeight + 2 + lineHeight(p.condition) + (showRange ? lineHeight(p.range) + 1 : 0));
+  const symbol = trailing(icon(m.code, m.isDay, p.mainIconWidth, p.mainIconHeight), p.mainIconHeight + 2);
+  const description = trailing(text(m.label, p.condition), lineHeight(p.condition));
+  const right = column(showRange ? [symbol, description, highLow(m, p.range, rangeWidth)] : [symbol, spacer(), description],
+    { width: p.rightWidth, alignItems: 'end', ...(showRange ? { gap: 0.5 } : { height }) });
   // 使用固定宽度、内部首尾 spacer；不让 flex frame 改变内容的实际对齐。
   return row([left, spacer(), right], { height, alignItems: 'start' });
 }
-function hourlyTimeline(m, p, upcoming = false) {
+function hourlyTimeline(m, p) {
   const labelHeight = lineHeight(p.hourLabel), temperatureHeight = lineHeight(p.hourTemperature);
   const height = labelHeight + 4 + p.hourIconHeight + 3 + temperatureHeight;
-  const hours = upcoming ? m.upcomingHours : m.hours;
-  const slots = Array.from({ length: 6 }, (_, i) => hours[i] || { label: '—', missing: true, temperature: null });
+  const slots = Array.from({ length: 6 }, (_, i) => m.hours[i] || { label: '—', missing: true, temperature: null });
   const columns = slots.map(h => column([
     centered(text(h.label, p.hourLabel, { font: { size: p.hourLabel, weight: 'medium' }, opacity: UI.secondary, textAlign: 'center' }), labelHeight),
     spacer(4),
     h.missing ? centered(text('—', 13, { opacity: 0.5 }), p.hourIconHeight) : icon(h.code, h.day, p.hourIconWidth, p.hourIconHeight),
     spacer(3),
-    centered(text(h.detail || temperatureText(h.temperature), h.detail ? p.hourLabel : p.hourTemperature,
-      { font: { size: h.detail ? p.hourLabel : p.hourTemperature, weight: 'medium' }, textAlign: 'center' }), temperatureHeight),
-  ], { ...(upcoming ? { width: 28 } : { flex: 1 }), alignItems: 'center' }));
-  return row(upcoming ? columns.flatMap((c, i) => i ? [spacer(), c] : [c]) : columns, { height });
+    centered(text(temperatureText(h.temperature), p.hourTemperature,
+      { font: { size: p.hourTemperature, weight: 'medium' }, textAlign: 'center' }), temperatureHeight),
+  ], { width: 28, alignItems: 'center' }));
+  return row(columns.flatMap((c, i) => i ? [spacer(), c] : [c]), { height });
 }
 function dailyCell(node, flex, align) {
   const wrap = align === 'end' ? trailing : align === 'start' ? leading : centered;
@@ -523,11 +506,11 @@ function smallContent(m, p) {
   ];
 }
 function mediumContent(m, p) {
-  return [spacer(), currentHeader(m, p), spacer(3), hourlyTimeline(m, p),
+  return [spacer(), currentHeader(m, p, true), spacer(3), hourlyTimeline(m, p),
     ...(m.stale ? [updateLabel(m.fetchedAt)] : []), spacer()];
 }
 function largeContent(m, p) {
-  return [currentHeader(m, p), separator(), summaryRow(m), separator(), spacer(4), hourlyTimeline(m, p, true),
+  return [currentHeader(m, p), separator(), summaryRow(m), separator(), spacer(4), hourlyTimeline(m, p),
     spacer(4), separator(), spacer(8), dailyTable(m),
     ...(m.stale ? [updateLabel(m.fetchedAt)] : [])];
 }
