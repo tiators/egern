@@ -10,7 +10,7 @@ const HEADERS = {
 };
 const MINUTE = 60000, HOUR = 60 * MINUTE, DAY = 24 * HOUR;
 const STALE_LIMIT = 6 * HOUR;
-const SNAPSHOT_VERSION = 2;
+const SNAPSHOT_VERSION = 3, FORECAST_DAYS = 5;
 // 固定槽名保持不变；内容版本独立升级，避免遗留第三条缓存记录。
 export const CACHE_KEYS = Object.freeze({ geo: 'egern.weather.geo.v1', weather: 'egern.weather.snapshot.v1' });
 const LIMITS = { geo: 768, weather: 3328 }; // 包含键名的 UTF-8 字节数。
@@ -57,7 +57,7 @@ function read(ctx, kind, region) {
     if (typeof raw !== 'string' || utf8Bytes(raw) + utf8Bytes(CACHE_KEYS[kind]) > LIMITS[kind]) throw Error();
     const value = JSON.parse(raw);
     if (value === null) return null;
-    if (!(kind === 'weather' ? [1, SNAPSHOT_VERSION].includes(value.version) : value.version === 1) || value.region !== region) throw Error();
+    if (!(kind === 'weather' ? [1, 2, SNAPSHOT_VERSION].includes(value.version) : value.version === 1) || value.region !== region) throw Error();
     return value;
   } catch (_) { remove(ctx, kind); return null; }
 }
@@ -84,8 +84,8 @@ function validSnapshot(s, now) {
     && onlyKeys(s.current, ['temperature', 'code']) && finite(s.current?.temperature) && typeof s.current?.code === 'string'
     && Array.isArray(s.hours) && s.hours.length <= 7
     && s.hours.every(h => onlyKeys(h, ['at', 'temperature', 'code']) && finite(h.at) && nullable(h.temperature) && typeof h.code === 'string')
-    // 兼容旧版“今天起五天”快照；新写入仅保留明天起四天。
-    && Array.isArray(s.days) && s.days.length <= 5
+    // 旧版今天起五天、未来四天均可读取；新快照保存明天起五天。
+    && Array.isArray(s.days) && s.days.length <= FORECAST_DAYS
     && s.days.every(d => onlyKeys(d, ['date', 'low', 'high', 'code']) && isDate(d.date) && nullable(d.low) && nullable(d.high) && typeof d.code === 'string')
     && (s.today === undefined || s.today === null || onlyKeys(s.today, ['date', 'low', 'high']) && isDate(s.today.date)
       && nullable(s.today.low) && nullable(s.today.high) && (finite(s.today.low) || finite(s.today.high))
@@ -215,7 +215,7 @@ export function normalizeWeather(data, region, now) {
   const dt = rows(daily.temperature, 'date', false), ds = rows(daily.skycon, 'date', false), da = rows(daily.astro, 'date', false);
   const range = dailyTemperatures(dt.get(today));
   if (range.low !== null || range.high !== null) snapshot.today = { date: today, ...range };
-  for (let i = 1; i <= 4; i++) {
+  for (let i = 1; i <= FORECAST_DAYS; i++) {
     const date = nextDate(today, i);
     if (dt.has(date) || ds.has(date)) {
       const { low, high } = dailyTemperatures(dt.get(date));
@@ -281,16 +281,6 @@ function twilightAt(s, now) {
   }
   return null;
 }
-function forecastSummary(day) {
-  if (!day || day.missing) return { text: '明天预报暂不可用', symbol: 'calendar' };
-  const weather = condition(day.code);
-  const label = weather.kind === 'unknown' ? '' : weather.label;
-  const temperatures = finite(day.low) && finite(day.high) ? `${temperatureText(day.low)}–${temperatureText(day.high)}`
-    : finite(day.high) ? `最高${temperatureText(day.high)}` : finite(day.low) ? `最低${temperatureText(day.low)}` : '';
-  if (!label && !temperatures) return { text: '明天预报暂不可用', symbol: 'calendar' };
-  return { text: `明天${label}${label && temperatures ? '，' : ''}${temperatures}`,
-    symbol: ['rain', 'storm'].includes(weather.kind) ? 'umbrella.fill' : 'calendar' };
-}
 export function viewModel(s, config, geo, now, stale = false) {
   const today = localParts(now, s).date;
   const floor = hourFloor(now, s), byHour = new Map(s.hours.map(h => [h.at, h]));
@@ -300,13 +290,13 @@ export function viewModel(s, config, geo, now, stale = false) {
     hours.push({ at, temperature: h?.temperature ?? null, code: h?.code || 'UNKNOWN',
       label: `${localParts(at, s).hour}时`, day: daytime(at, s, h?.code || ''), missing: !h });
   }
-  const futureDays = Array.from({ length: 4 }, (_, i) => {
+  const futureDays = Array.from({ length: FORECAST_DAYS }, (_, i) => {
     const date = nextDate(today, i + 1), d = s.days.find(d => d.date === date);
     const label = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(`${date}T12:00:00Z`).getUTCDay()];
     return { date, label, low: d?.low ?? null, high: d?.high ?? null, code: d?.code || 'UNKNOWN', missing: !d };
   });
   return { title: config.title || geo?.name || config.region, ...s.current, ...condition(s.current.code),
-    today: todayTemperatures(s, today), hours, futureDays, summary: forecastSummary(futureDays[0]),
+    today: todayTemperatures(s, today), hours, futureDays,
     isDay: daytime(now, s, s.current.code), twilight: twilightAt(s, now), stale, fetchedAt: s.fetchedAt };
 }
 
@@ -501,8 +491,8 @@ function rangeBar(day, days) {
   if (range.after > 0) parts.push({ type: 'spacer', flex: range.after });
   return row(parts, { flex: 1, height: 4 });
 }
-function dailyTable(m) {
-  const children = [{ type: 'spacer', flex: 0.5 }];
+function dailyRows(m) {
+  const children = [];
   m.futureDays.forEach((d, i) => {
     children.push(row([
       dailyCell(text(d.label, 14, { font: { size: 14, weight: 'medium' } }), 1, 'start'),
@@ -511,14 +501,9 @@ function dailyTable(m) {
       row([spacer(8), rangeBar(d, m.futureDays)], { flex: 2.4, height: 4 }),
       dailyCell(text(temperatureText(d.high), 14, { font: { size: 14, weight: 'semibold' }, textAlign: 'right' }), 0.7, 'end'),
     ], { height: 25 }));
-    if (i < 3) children.push(spacer());
+    if (i < m.futureDays.length - 1) children.push(spacer());
   });
-  children.push({ type: 'spacer', flex: 0.5 });
-  return column(children, { flex: 1 });
-}
-function summaryRow(m) {
-  return row([{ type: 'image', src: `sf-symbol:${m.summary.symbol}`, width: 16, height: 16, color: UI.white },
-    text(m.summary.text, 13, { minScale: 0.7 }), spacer()], { height: 28, gap: 7 });
+  return children;
 }
 function smallContent(m, p) {
   return [
@@ -539,8 +524,10 @@ function mediumContent(m, p) {
     ...(m.stale ? [updateLabel(m.fetchedAt)] : []), spacer()];
 }
 function largeContent(m, p) {
-  return [currentHeader(m, p), separator(), summaryRow(m), separator(), spacer(4), hourlyTimeline(m, p),
-    spacer(4), separator(), spacer(8), dailyTable(m),
+  // 两条分隔线和五行预报；弹性间距在标准尺寸舒展，在紧凑尺寸自动收拢。
+  return [currentHeader(m, p), separator(), { type: 'spacer', flex: 2 }, hourlyTimeline(m, p),
+    { type: 'spacer', flex: 2.5 }, separator(), { type: 'spacer', flex: 2.75 }, ...dailyRows(m),
+    { type: 'spacer', flex: 0.5 },
     ...(m.stale ? [updateLabel(m.fetchedAt)] : [])];
 }
 export function renderWidget(m, family, config, refreshAt) {
