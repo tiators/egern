@@ -87,7 +87,7 @@ function validSnapshot(s, now) {
     // 兼容旧版“今天起五天”快照；新写入仅保留明天起四天。
     && Array.isArray(s.days) && s.days.length <= 5
     && s.days.every(d => onlyKeys(d, ['date', 'low', 'high', 'code']) && isDate(d.date) && nullable(d.low) && nullable(d.high) && typeof d.code === 'string')
-    && (s.today === undefined || onlyKeys(s.today, ['date', 'low', 'high']) && isDate(s.today.date)
+    && (s.today === undefined || s.today === null || onlyKeys(s.today, ['date', 'low', 'high']) && isDate(s.today.date)
       && nullable(s.today.low) && nullable(s.today.high) && (finite(s.today.low) || finite(s.today.high))
       && (s.today.low === null || s.today.high === null || s.today.low <= s.today.high))
     && Array.isArray(s.astro) && s.astro.length <= 2
@@ -187,7 +187,7 @@ function dailyTemperatures(value) {
   return { low, high };
 }
 function todayTemperatures(s, date) {
-  // 旧五天快照可直接提供今日范围；旧四天快照等待正常刷新，不额外联网。
+  // 旧五天快照可直接提供今日范围；旧四天快照缺少此数据时由入口补取。
   const d = s.today?.date === date ? s.today : s.days.find(d => d.date === date);
   return finite(d?.low) || finite(d?.high) ? { date, low: d.low ?? null, high: d.high ?? null } : null;
 }
@@ -200,7 +200,8 @@ export function normalizeWeather(data, region, now) {
   const snapshot = { version: SNAPSHOT_VERSION, region, fetchedAt: now, sourceAt: numeric(data.server_time),
     timezone: short(data.timezone, 64), shift: shift !== null && Math.abs(shift) <= 86400 ? shift : 28800,
     current: { temperature: numeric(current.temperature), code: codeOf(current.skycon) },
-    hours: [], days: [], astro: [], failures: 0, retryAt: 0 };
+    // null 表示本次已查询但无今日范围；字段缺失才表示旧快照尚未查询。
+    hours: [], days: [], today: null, astro: [], failures: 0, retryAt: 0 };
   const today = localParts(now, snapshot).date;
   const daily = r.daily?.status === 'ok' ? r.daily : {};
   const hourly = r.hourly?.status === 'ok' ? r.hourly : {};
@@ -234,7 +235,7 @@ export function normalizeWeather(data, region, now) {
 function prune(s, now) {
   const date = localParts(now, s).date, range = todayTemperatures(s, date);
   const { today, ...rest } = s;
-  return { ...rest, ...(range ? { today: range } : {}), hours: s.hours.filter(h => h.at > now),
+  return { ...rest, today: range, hours: s.hours.filter(h => h.at > now),
     days: s.days.filter(d => d.date > date), astro: s.astro.filter(a => a.date >= date) };
 }
 function daytime(at, snapshot, code) {
@@ -562,7 +563,9 @@ export async function runWidget(ctx, clock = Date.now) {
     if (snapshot) write(ctx, 'weather', snapshot); else remove(ctx, 'weather');
   }
   const ttl = config.refreshMinutes * MINUTE;
-  if (snapshot?.version === SNAPSHOT_VERSION && snapshot.current && !snapshot.failures && ageWithin(snapshot.fetchedAt, ttl, now)) {
+  const needsToday = family !== 'systemSmall' && snapshot?.current && snapshot.today === undefined
+    && !todayTemperatures(snapshot, localParts(now, snapshot).date);
+  if (snapshot?.version === SNAPSHOT_VERSION && snapshot.current && !snapshot.failures && !needsToday && ageWithin(snapshot.fetchedAt, ttl, now)) {
     return renderWidget(viewModel(snapshot, config, geo, now), family, config, snapshot.fetchedAt + ttl);
   }
   if (snapshot?.retryAt > now) {
