@@ -408,7 +408,8 @@ export function temperatureRange(day, days) {
 // ---------- UI：以用户当前实机截图为基准，三尺寸共用排版组件 ----------
 const UI = Object.freeze({
   white: '#FFFFFF', secondary: 0.82,
-  small: { padding: [7, 16, 7, 16], title: 15, temperature: 44, condition: 12 },
+  small: { padding: [7, 16, 7, 16], title: 15, temperature: 42, condition: 12,
+    rangeTemperature: 24, rangeLabel: 9 },
   medium: { padding: [0, 16, 0, 16], title: 16, temperature: 44, condition: 14,
     leftWidth: 120, rightWidth: 136, mainIconWidth: 20, mainIconHeight: 16,
     rangeTemperature: 24, rangeLabel: 9, rangeBottom: 4,
@@ -447,14 +448,15 @@ function updateLabel(at) {
   return row([text('上次更新', 9, { opacity: 0.8 }), { type: 'date', date: new Date(at).toISOString(), format: 'relative',
     font: { size: 9 }, textColor: '#FFFFFFCC', textAlign: 'left', maxLines: 1, minScale: 0.5 }, spacer()], { gap: 3, height: 12 });
 }
-function todayRange(m, p) {
+function todayRange(m, p, align = 'end') {
   const label = last => column([text('最', p.rangeLabel), text(last, p.rangeLabel)],
     { width: p.rangeLabel, alignItems: 'center' });
   const value = n => text(temperatureText(n), p.rangeTemperature,
     { font: { size: p.rangeTemperature, weight: 'light' }, textAlign: 'right' });
-  // 在固定宽度内使用前置弹性间距，确保最低温的右边缘与天气文字一致。
-  return row([spacer(), label('高'), value(m.today.high), spacer(5), label('低'), value(m.today.low)],
-    { width: p.rightWidth, height: lineHeight(p.rangeTemperature), gap: 1 });
+  const values = [label('高'), value(m.today.high), spacer(5), label('低'), value(m.today.low)];
+  // 小号靠左排，中大号靠右排；温度过长时在可用行宽内缩小。
+  return row(align === 'start' ? [...values, spacer()] : [spacer(), ...values],
+    { ...(align === 'end' ? { width: p.rightWidth } : {}), height: lineHeight(p.rangeTemperature), gap: 1 });
 }
 function currentHeader(m, p) {
   const title = text(m.title, p.title, { font: { size: p.title, weight: 'medium' } });
@@ -520,12 +522,16 @@ function summaryRow(m) {
 }
 function smallContent(m, p) {
   return [
+    { type: 'spacer', flex: 1.5 },
     leading(text(m.title, p.title, { font: { size: p.title, weight: 'medium' } }), lineHeight(p.title)),
     leading(text(temperatureText(m.temperature), p.temperature, { font: { size: p.temperature, weight: 'light' } }), lineHeight(p.temperature)),
-    spacer(),
     leading(icon(m.code, m.isDay, 18, 14), 14),
     leading(text(m.label, p.condition), lineHeight(p.condition)),
+    spacer(),
+    // 缺少范围时保留行高，避免标题和当前天气随数据缺失上下跳动。
+    m.today ? todayRange(m, p, 'start') : spacer(lineHeight(p.rangeTemperature)),
     ...(m.stale ? [updateLabel(m.fetchedAt)] : []),
+    { type: 'spacer', flex: 1.3 },
   ];
 }
 function mediumContent(m, p) {
@@ -563,7 +569,7 @@ export async function runWidget(ctx, clock = Date.now) {
     if (snapshot) write(ctx, 'weather', snapshot); else remove(ctx, 'weather');
   }
   const ttl = config.refreshMinutes * MINUTE;
-  const needsToday = family !== 'systemSmall' && snapshot?.current && snapshot.today === undefined
+  const needsToday = snapshot?.current && snapshot.today === undefined
     && !todayTemperatures(snapshot, localParts(now, snapshot).date);
   if (snapshot?.version === SNAPSHOT_VERSION && snapshot.current && !snapshot.failures && !needsToday && ageWithin(snapshot.fetchedAt, ttl, now)) {
     return renderWidget(viewModel(snapshot, config, geo, now), family, config, snapshot.fetchedAt + ttl);
