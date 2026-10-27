@@ -415,6 +415,9 @@ const column = (children, extra = {}) => ({ type: 'stack', direction: 'column', 
 const spacer = length => length === undefined ? { type: 'spacer' } : { type: 'spacer', length };
 const icon = (code, day, width, height = width) => ({ type: 'image', ...iconSource(code, day), width, height, resizeMode: 'contain' });
 const detailURL = `${H5}/h5`;
+// WidgetKit 先把点击 URL 交给宿主；使用 Egern 官方 x-success 回调转交网页。
+// connections 仅打开列表，不启动/停止 VPN，也不修改配置。
+const widgetTapURL = `egern:/connections?x-success=${encodeURIComponent(detailURL)}`;
 const leading = (node, height) => row([node, spacer()], { height });
 const trailing = (node, height) => row([spacer(), node], { height });
 const centered = (node, height) => row([spacer(), node, spacer()], { height });
@@ -508,11 +511,11 @@ export function renderWidget(m, family, config, refreshAt) {
   const p = profileFor(family, m.stale);
   const render = family === 'systemSmall' ? smallContent : family === 'systemLarge' ? largeContent : mediumContent;
   return { type: 'widget', padding: p.padding, gap: 0, backgroundGradient: themeFor(m), backgroundImage: skyBackground(m, family),
-    url: detailURL, refreshAfter: new Date(refreshAt).toISOString(), children: render(m, p) };
+    url: widgetTapURL, refreshAfter: new Date(refreshAt).toISOString(), children: render(m, p) };
 }
 function messageWidget(config, family, message, refreshAt) {
   return { type: 'widget', padding: 12, backgroundGradient: themeFor({ isDay: false }),
-    refreshAfter: new Date(refreshAt).toISOString(), url: detailURL,
+    refreshAfter: new Date(refreshAt).toISOString(), url: widgetTapURL,
     children: [text(config.title || config.region || '配置天气地区', 14), spacer(),
       text('—', 34), text(message, 11, { maxLines: family === 'systemSmall' ? 2 : 3, opacity: 0.85 }), spacer()] };
 }
