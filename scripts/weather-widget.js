@@ -10,7 +10,7 @@ const HEADERS = {
 };
 const MINUTE = 60000, HOUR = 60 * MINUTE, DAY = 24 * HOUR;
 const STALE_LIMIT = 6 * HOUR;
-const SNAPSHOT_VERSION = 3, FORECAST_DAYS = 5;
+const SNAPSHOT_VERSION = 4, FORECAST_DAYS = 5;
 // 固定槽名保持不变；内容版本独立升级，避免遗留第三条缓存记录。
 export const CACHE_KEYS = Object.freeze({ geo: 'egern.weather.geo.v1', weather: 'egern.weather.snapshot.v1' });
 const LIMITS = { geo: 768, weather: 3328 }; // 包含键名的 UTF-8 字节数。
@@ -18,6 +18,11 @@ const finite = n => typeof n === 'number' && Number.isFinite(n);
 const numeric = n => (typeof n === 'number' || typeof n === 'string' && n.trim() !== '') && finite(Number(n)) ? Number(n) : null;
 const short = (s, n) => Array.from(typeof s === 'string' ? s : '').slice(0, n).join('');
 const codeOf = s => typeof s === 'string' && /^[A-Z_]{1,32}$/.test(s) ? s : 'UNKNOWN';
+const needsCloud = code => ['LIGHT_RAIN', 'MODERATE_RAIN'].includes(code);
+const cloudValue = value => {
+  const n = numeric(value);
+  return n !== null && n >= 0 && n <= 1 ? Math.round(n * 100) / 100 : null;
+};
 const onlyKeys = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).every(key => keys.includes(key));
 const ageWithin = (at, duration, now) => finite(at) && at <= now && now - at < duration;
@@ -57,7 +62,7 @@ function read(ctx, kind, region) {
     if (typeof raw !== 'string' || utf8Bytes(raw) + utf8Bytes(CACHE_KEYS[kind]) > LIMITS[kind]) throw Error();
     const value = JSON.parse(raw);
     if (value === null) return null;
-    if (!(kind === 'weather' ? [1, 2, SNAPSHOT_VERSION].includes(value.version) : value.version === 1) || value.region !== region) throw Error();
+    if (!(kind === 'weather' ? [1, 2, 3, SNAPSHOT_VERSION].includes(value.version) : value.version === 1) || value.region !== region) throw Error();
     return value;
   } catch (_) { remove(ctx, kind); return null; }
 }
@@ -74,16 +79,19 @@ function validGeo(g) {
     && finite(g.lat) && Math.abs(g.lat) <= 90 && typeof g.name === 'string';
 }
 function validSnapshot(s, now) {
-  if (!onlyKeys(s, ['version', 'region', 'fetchedAt', 'sourceAt', 'timezone', 'shift', 'current', 'hours', 'days', 'today', 'astro', 'failures', 'retryAt'])
+  if (!onlyKeys(s, ['version', 'region', 'fetchedAt', 'sourceAt', 'timezone', 'shift', 'current', 'hours', 'days', 'today', 'astro', 'notice', 'failures', 'retryAt'])
     || !Number.isInteger(s.failures) || s.failures < 0 || s.failures > 3
     || !finite(s.retryAt) || s.retryAt < 0 || s.retryAt > now + 30 * MINUTE) return false;
   if (s.fetchedAt === undefined) return s.failures > 0 && onlyKeys(s, ['version', 'region', 'failures', 'retryAt']);
   const nullable = n => n === null || finite(n);
+  const validCloud = h => h.cloud === undefined || needsCloud(h.code) && finite(h.cloud) && h.cloud >= 0 && h.cloud <= 1;
   return finite(s.fetchedAt) && s.fetchedAt <= now && nullable(s.sourceAt)
     && typeof s.timezone === 'string' && finite(s.shift) && Math.abs(s.shift) <= 86400
-    && onlyKeys(s.current, ['temperature', 'code']) && finite(s.current?.temperature) && typeof s.current?.code === 'string'
+    && onlyKeys(s.current, ['temperature', 'code', 'cloud']) && finite(s.current?.temperature) && typeof s.current?.code === 'string' && validCloud(s.current)
     && Array.isArray(s.hours) && s.hours.length <= 7
-    && s.hours.every(h => onlyKeys(h, ['at', 'temperature', 'code']) && finite(h.at) && nullable(h.temperature) && typeof h.code === 'string')
+    && s.hours.every(h => onlyKeys(h, ['at', 'temperature', 'code', 'cloud']) && finite(h.at) && nullable(h.temperature) && typeof h.code === 'string' && validCloud(h))
+    && (s.notice === undefined || onlyKeys(s.notice, ['text', 'until']) && typeof s.notice.text === 'string'
+      && Array.from(s.notice.text).length <= 48 && finite(s.notice.until) && s.notice.until > s.fetchedAt && s.notice.until <= s.fetchedAt + 15 * MINUTE)
     // 旧版今天起五天、未来四天均可读取；新快照保存明天起五天。
     && Array.isArray(s.days) && s.days.length <= FORECAST_DAYS
     && s.days.every(d => onlyKeys(d, ['date', 'low', 'high', 'code']) && isDate(d.date) && nullable(d.low) && nullable(d.high) && typeof d.code === 'string')
@@ -203,14 +211,22 @@ export function normalizeWeather(data, region, now) {
     // null 表示本次已查询但无今日范围；字段缺失才表示旧快照尚未查询。
     hours: [], days: [], today: null, astro: [], failures: 0, retryAt: 0 };
   const today = localParts(now, snapshot).date;
+  const currentCloud = cloudValue(current.cloudrate);
+  if (needsCloud(snapshot.current.code) && currentCloud !== null) snapshot.current.cloud = currentCloud;
   const daily = r.daily?.status === 'ok' ? r.daily : {};
   const hourly = r.hourly?.status === 'ok' ? r.hourly : {};
   const ht = rows(hourly.temperature, 'datetime', true), hs = rows(hourly.skycon, 'datetime', true);
+  const hc = rows(hourly.cloudrate, 'datetime', true);
   const floor = hourFloor(now, snapshot);
   // 六个未来整点加一个跨整点备用值，最大刷新间隔为一小时。
   for (let i = 1; i <= 7; i++) {
     const at = floor + i * HOUR;
-    if (ht.has(at) || hs.has(at)) snapshot.hours.push({ at, temperature: numeric(ht.get(at)?.value), code: codeOf(hs.get(at)?.value) });
+    if (ht.has(at) || hs.has(at)) {
+      const h = { at, temperature: numeric(ht.get(at)?.value), code: codeOf(hs.get(at)?.value) };
+      const cloud = cloudValue(hc.get(at)?.value);
+      if (needsCloud(h.code) && cloud !== null) h.cloud = cloud;
+      snapshot.hours.push(h);
+    }
   }
   const dt = rows(daily.temperature, 'date', false), ds = rows(daily.skycon, 'date', false), da = rows(daily.astro, 'date', false);
   const range = dailyTemperatures(dt.get(today));
@@ -230,12 +246,19 @@ export function normalizeWeather(data, region, now) {
       snapshot.astro.push({ date, rise: minutes(a?.sunrise?.time), set: minutes(a?.sunset?.time) });
     }
   }
+  const minute = r.minutely;
+  const description = typeof minute?.description === 'string' ? minute.description.replace(/[\r\n\t]/g, ' ').trim() : '';
+  // 只保留确有降水时的短时描述，15 分钟后隐藏；不保存分钟数组或推算概率。
+  if (minute?.status === 'ok' && description && Array.from(description).length <= 48
+    && /雨|雪/.test(description) && Array.isArray(minute.precipitation) && minute.precipitation.some(n => finite(n) && n > 0)) {
+    snapshot.notice = { text: description, until: now + 15 * MINUTE };
+  }
   return snapshot;
 }
 function prune(s, now) {
   const date = localParts(now, s).date, range = todayTemperatures(s, date);
-  const { today, ...rest } = s;
-  return { ...rest, today: range, hours: s.hours.filter(h => h.at > now),
+  const { today, notice, ...rest } = s;
+  return { ...rest, ...(notice?.until > now ? { notice } : {}), today: range, hours: s.hours.filter(h => h.at > now),
     days: s.days.filter(d => d.date > date), astro: s.astro.filter(a => a.date >= date) };
 }
 function daytime(at, snapshot, code) {
@@ -250,6 +273,7 @@ export function condition(code) {
     CLEAR_DAY: ['晴', 'clear'], CLEAR_NIGHT: ['晴', 'clear'], PARTLY_CLOUDY_DAY: ['多云', 'partly'], PARTLY_CLOUDY_NIGHT: ['多云', 'partly'], CLOUDY: ['阴', 'cloud'],
     LIGHT_RAIN: ['小雨', 'rain'], MODERATE_RAIN: ['中雨', 'rain'], HEAVY_RAIN: ['大雨', 'rain'], STORM_RAIN: ['暴雨', 'rain'], RAIN: ['雨', 'rain'],
     LIGHT_SNOW: ['小雪', 'snow'], MODERATE_SNOW: ['中雪', 'snow'], HEAVY_SNOW: ['大雪', 'snow'], STORM_SNOW: ['暴雪', 'snow'], SNOW: ['雪', 'snow'],
+    SLEET: ['雨夹雪', 'mixed'], RAIN_SNOW: ['雨夹雪', 'mixed'], HAIL: ['冰雹', 'hail'], FREEZING_RAIN: ['冻雨', 'ice'], FREEZING_DRIZZLE: ['冻毛毛雨', 'ice'],
     LIGHT_HAZE: ['轻度雾霾', 'haze'], MODERATE_HAZE: ['中度雾霾', 'haze'], HEAVY_HAZE: ['重度雾霾', 'haze'],
     FOG: ['雾', 'fog'], DUST: ['浮尘', 'haze'], SAND: ['沙尘', 'haze'], WIND: ['大风', 'wind'], THUNDER_SHOWER: ['雷阵雨', 'storm'],
   };
@@ -273,11 +297,11 @@ function twilightAt(s, now) {
   const date = localParts(now, s).date, astro = s.astro.find(a => a.date === date);
   if (!astro) return null;
   const sunset = localTimeAt(date, astro.set, s), sunrise = localTimeAt(date, astro.rise, s);
-  if (sunset !== null && now >= sunset && now < sunset + 90 * MINUTE) {
-    return { phase: 'dusk', amount: (now - sunset) / (90 * MINUTE) };
+  if (sunset !== null && now >= sunset - 45 * MINUTE && now < sunset + 75 * MINUTE) {
+    return { phase: 'dusk', amount: (now - sunset + 45 * MINUTE) / (120 * MINUTE) };
   }
-  if (sunrise !== null && now >= sunrise - 45 * MINUTE && now < sunrise + 15 * MINUTE) {
-    return { phase: 'dawn', amount: (now - sunrise + 45 * MINUTE) / HOUR };
+  if (sunrise !== null && now >= sunrise - 45 * MINUTE && now < sunrise + 30 * MINUTE) {
+    return { phase: 'dawn', amount: (now - sunrise + 45 * MINUTE) / (75 * MINUTE) };
   }
   return null;
 }
@@ -288,11 +312,9 @@ function solarTimeline(s, now, hours) {
     for (const [event, minute] of [['sunrise', a.rise], ['sunset', a.set]]) {
       const at = localTimeAt(a.date, minute, s);
       if (at === null || at <= now || at > last) continue;
-      const p = localParts(at, s), floor = hourFloor(at, s);
-      // 直接使用相邻的下一整点预报，不插值；缺少该小时温度时显示 —。
-      const temperatureAt = floor === at ? at : floor + HOUR;
-      const temperature = s.hours.find(h => h.at === temperatureAt)?.temperature ?? null;
-      events.push({ at, event, temperatureAt, temperature, missing: false,
+      const p = localParts(at, s);
+      // 接口没有分钟温度；该列明确显示日出/日落名称，不借用整点温度。
+      events.push({ at, event, temperature: null, missing: false,
         label: `${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')}` });
     }
   }
@@ -305,7 +327,7 @@ export function viewModel(s, config, geo, now, stale = false) {
   const hours = [];
   for (let i = 1; i <= 6; i++) {
     const at = floor + i * HOUR, h = byHour.get(at);
-    hours.push({ at, temperature: h?.temperature ?? null, code: h?.code || 'UNKNOWN',
+    hours.push({ at, temperature: h?.temperature ?? null, code: h?.code || 'UNKNOWN', cloud: h?.cloud,
       label: `${localParts(at, s).hour}时`, day: daytime(at, s, h?.code || ''), missing: !h });
   }
   const futureDays = Array.from({ length: FORECAST_DAYS }, (_, i) => {
@@ -314,10 +336,14 @@ export function viewModel(s, config, geo, now, stale = false) {
     return { date, label, low: d?.low ?? null, high: d?.high ?? null, code: d?.code || 'UNKNOWN', missing: !d };
   });
   const timeline = solarTimeline(s, now, hours);
-  const nextChangeAt = Math.min(floor + HOUR, ...timeline.filter(h => h.event).map(h => h.at));
+  const twilight = twilightAt(s, now), notice = !stale && s.notice?.until > now ? s.notice : null;
+  const boundaries = s.astro.flatMap(a => [localTimeAt(a.date, a.rise, s), localTimeAt(a.date, a.set, s)])
+    .filter(finite).map(at => at - 45 * MINUTE).filter(at => at > now);
+  const nextChangeAt = Math.min(floor + HOUR, ...timeline.filter(h => h.event).map(h => h.at), ...boundaries,
+    twilight ? (Math.floor(now / (15 * MINUTE)) + 1) * 15 * MINUTE : Infinity, notice?.until ?? Infinity);
   return { title: config.title || geo?.name || config.region, ...s.current, ...condition(s.current.code),
-    today: todayTemperatures(s, today), hours: timeline, futureDays, nextChangeAt,
-    isDay: daytime(now, s, s.current.code), twilight: twilightAt(s, now), stale, fetchedAt: s.fetchedAt };
+    today: todayTemperatures(s, today), hours: timeline, futureDays, nextChangeAt, notice,
+    isDay: daytime(now, s, s.current.code), twilight, stale, fetchedAt: s.fetchedAt };
 }
 
 // ---------- 图标：组合图标为内置 SVG，简单图标使用 SF Symbols ----------
@@ -333,6 +359,17 @@ function svgData(markup) {
   return `data:image/svg+xml;base64,${encoded}`;
 }
 const CLOUD = "<path d='M16 35C8 35 5 30 5 25S9 15 15 15C18 7 28 5 35 9C39 11 41 14 42 18C50 16 58 21 58 27C58 32 54 35 48 35Z' fill='#F3F7FC'/>";
+function rainStrokes(code) {
+  const styles = {
+    LIGHT_RAIN: ['M20 42l-2 4M33 40l-2 4M46 42l-2 4', 2.5],
+    MODERATE_RAIN: ['M20 40l-3 8M33 40l-3 8M46 40l-3 8', 3],
+    HEAVY_RAIN: ['M16 39l-4 12M27 39l-4 12M38 39l-4 12M49 39l-4 12', 3.5],
+    STORM_RAIN: ['M13 39l-4 12M21 39l-4 12M29 39l-4 12M37 39l-4 12M45 39l-4 12M53 39l-4 12', 4],
+  };
+  // 未分级的雨保留通用图标；仅用天气码区分强度，不推算降雨量。
+  const [path, width] = styles[code] || ['M21 41l-3 7M33 41l-3 7M45 41l-3 7', 3];
+  return `<path d='${path}' fill='none' stroke='#42CAE6' stroke-width='${width}' stroke-linecap='round'/>`;
+}
 function solarIcon(event, width, height) {
   const arrow = event === 'sunrise' ? 'M32 17V3m-6 6 6-6 6 6' : 'M32 3v14m-6-6 6 6 6-6';
   const src = svgData(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 56'>
@@ -342,25 +379,46 @@ function solarIcon(event, width, height) {
 <path d='M5 49h54' fill='none' stroke='#FFFFFF' stroke-width='3' stroke-linecap='round'/></svg>`);
   return { type: 'image', src, width, height, resizeMode: 'contain' };
 }
-export function iconSource(code, day, overview = false) {
+const MOON = "<path d='M51 2C38 3 36 18 46 24C51 27 58 25 61 21C50 23 44 10 51 2Z' fill='#F6F5ED'/>";
+function snowMarks(code) {
+  const points = code === 'LIGHT_SNOW' ? [[23,44],[41,47]] : code === 'HEAVY_SNOW' || code === 'STORM_SNOW'
+    ? [[15,43],[27,49],[39,43],[51,49]] : [[20,44],[32,49],[45,44]];
+  const marks = points.map(([x,y]) => `<path d='M${x-2} ${y}h4M${x} ${y-2}v4'/>`).join('');
+  const wind = code === 'STORM_SNOW' ? "<path d='M8 38h17M34 38h22M5 52h12'/>" : '';
+  return `<g fill='none' stroke='#E2F5FF' stroke-width='2.2' stroke-linecap='round'>${marks}${wind}</g>`;
+}
+export function iconSource(code, day, overview = false, cloud) {
   const { kind } = condition(code);
-  if (kind === 'clear') return { src: `sf-symbol:${day ? 'sun.max.fill' : 'moon.fill'}`, color: day ? '#FFD879' : '#F6F5ED' };
-  if (kind === 'cloud' || kind === 'partly' && overview) return { src: 'sf-symbol:cloud.fill', color: '#F3F7FC' };
-  if (kind === 'fog' || kind === 'haze') return { src: 'sf-symbol:cloud.fog.fill', color: '#F3F7FC' };
-  if (kind === 'wind') return { src: 'sf-symbol:wind', color: '#F3F7FC' };
-  if (kind === 'unknown') return { src: 'sf-symbol:questionmark', color: '#FFFFFF99' };
   let body = CLOUD;
-  if (kind === 'partly') body = (day ? "<circle cx='44' cy='15' r='12' fill='#FFD879'/>"
-    : "<path d='M51 2C38 3 36 18 46 24C51 27 58 25 61 21C50 23 44 10 51 2Z' fill='#F6F5ED'/>") + `<g transform='translate(-2 6)'>${CLOUD}</g>`;
+  if (kind === 'clear') body = day
+    ? "<circle cx='32' cy='28' r='12' fill='#FFD879'/><path d='M32 5v5M32 46v5M9 28h5M50 28h5M16 12l4 4M44 40l4 4M48 12l-4 4M20 40l-4 4' stroke='#FFD879' stroke-width='3' stroke-linecap='round'/>"
+    : "<path d='M39 6C17 5 9 30 24 44C35 54 53 47 57 36C39 42 26 20 39 6Z' fill='#F6F5ED'/>";
+  if (kind === 'partly' && !overview) body = (day ? "<circle cx='45' cy='14' r='11' fill='#FFD879'/>" : MOON) + CLOUD;
   if (kind === 'rain') {
-    if (!day && ['LIGHT_RAIN', 'MODERATE_RAIN'].includes(code)) {
-      body = "<path d='M51 2C38 3 36 18 46 24C51 27 58 25 61 21C50 23 44 10 51 2Z' fill='#F6F5ED'/>"
-        + `<g transform='translate(-1 4) scale(.9)'>${CLOUD}</g>`;
-    }
-    body += "<path d='M21 41l-3 7M33 41l-3 7M45 41l-3 7' stroke='#42CAE6' stroke-width='3' stroke-linecap='round'/>";
+    // 云量缺失或厚云时采用普通雨云，不能仅凭夜间就画月牙。
+    if (!day && needsCloud(code) && finite(cloud) && cloud <= .8) body = MOON + CLOUD;
+    body += rainStrokes(code);
   }
-  if (kind === 'snow') body += "<g fill='#E2F5FF'><circle cx='20' cy='44' r='2'/><circle cx='32' cy='48' r='2'/><circle cx='44' cy='43' r='2'/></g>";
-  if (kind === 'storm') body += "<path d='M34 34L23 47h9l-5 9 18-17h-10l5-5Z' fill='#FFD879'/>";
+  if (kind === 'snow') body += snowMarks(code);
+  if (kind === 'fog') body += "<path d='M9 42h46M15 49h34' fill='none' stroke='#F3F7FC' stroke-width='3' stroke-linecap='round'/>";
+  if (kind === 'haze') {
+    if (code === 'DUST' || code === 'SAND') {
+      const sand = code === 'SAND';
+      body = `<g fill='none' stroke='#D8C49B' stroke-width='3' stroke-linecap='round'><path d='M7 20h31q12 0 9-8M12 31h37q10 0 8 7M7 43h25'/>${sand ? "<path d='M17 12h12M37 46h16'/>" : ''}</g>`
+        + `<g fill='#D8C49B'><circle cx='13' cy='12' r='2'/><circle cx='43' cy='43' r='2'/><circle cx='24' cy='51' r='2'/>${sand ? "<circle cx='6' cy='32' r='2'/><circle cx='56' cy='20' r='2'/>" : ''}</g>`;
+    } else {
+      const lines = code === 'HEAVY_HAZE' ? [30,37,44,51] : code === 'MODERATE_HAZE' ? [32,41,50] : [36,46];
+      body = `<circle cx='32' cy='21' r='12' fill='${day ? '#EBD5A1' : '#DBDFE7'}'/>`
+        + `<g stroke='#D8D4C5' stroke-width='3' stroke-linecap='round'>${lines.map((y,i)=>`<path d='M${i%2 ? 13 : 7} ${y}h${i%2 ? 38 : 50}'/>`).join('')}</g>`;
+    }
+  }
+  if (kind === 'wind') body = "<path d='M6 17h30c14 0 14-13 4-11M6 28h42c14 0 14 15 4 14M12 40h19c10 0 10 11 3 11' fill='none' stroke='#F3F7FC' stroke-width='3' stroke-linecap='round'/>";
+  if (kind === 'mixed') body += "<path d='M19 40l-3 9M44 40l-3 9' stroke='#42CAE6' stroke-width='3' stroke-linecap='round'/><path d='M28 46h8M32 42v8' stroke='#E2F5FF' stroke-width='2.4' stroke-linecap='round'/>";
+  if (kind === 'ice' || kind === 'hail') body += kind === 'hail'
+    ? "<g fill='#E2F5FF'><path d='M18 40l4 5-4 5-4-5ZM33 44l4 5-4 5-4-5ZM48 40l4 5-4 5-4-5Z'/></g>"
+    : "<path d='M18 39l-3 7M33 39l-3 7M48 39l-3 7' stroke='#8AE2EF' stroke-width='3' stroke-linecap='round'/><path d='M14 52h35' stroke='#E2F5FF' stroke-width='2.5' stroke-linecap='round'/>";
+  if (kind === 'storm') body += "<path d='M15 42l-3 7M53 42l-3 7' fill='none' stroke='#42CAE6' stroke-width='3' stroke-linecap='round'/><path d='M34 33L24 45h8l-4 8 16-16h-10l5-4Z' fill='#FFD879'/>";
+  if (kind === 'unknown') body = "<path d='M23 19c0-13 24-13 24 0 0 8-13 7-13 17' fill='none' stroke='#FFFFFF99' stroke-width='4' stroke-linecap='round'/><circle cx='34' cy='46' r='2.5' fill='#FFFFFF99'/>";
   return { src: svgData(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 56'>${body}</svg>`) };
 }
 export function themeFor(model) {
@@ -371,18 +429,19 @@ export function themeFor(model) {
     haze: ['#7D8995', '#707C89', '#616E7C'], storm: ['#4D5D73', '#394D66', '#293C55'],
     wind: ['#638198', '#54758E', '#42647E'],
   };
-  const night = ['cloud', 'fog', 'haze', 'rain', 'storm'].includes(model.kind)
-    ? ['#343941', '#2B303A', '#222831'] : ['#201D31', '#252640', '#2B3552'];
-  let colors = model.isDay ? themes[model.kind] || themes.cloud : night;
-  if (model.twilight && ['clear', 'partly', 'cloud', 'fog', 'haze'].includes(model.kind)) {
+  const night = ['clear', 'partly'].includes(model.kind) ? ['#201D31', '#252640', '#2B3552'] : ['#343941', '#2B303A', '#222831'];
+  const day = themes[model.kind] || themes.cloud;
+  let colors = model.isDay ? day : night;
+  if (model.twilight) {
     const mix = (a, b, amount) => '#' + [1, 3, 5].map(i => Math.round(parseInt(a.slice(i, i + 2), 16) * (1 - amount)
       + parseInt(b.slice(i, i + 2), 16) * amount).toString(16).padStart(2, '0')).join('');
+    const smooth = t => t * t * (3 - 2 * t);
     const t = Math.max(0, Math.min(1, model.twilight.amount));
-    const warm = ['clear', 'partly'].includes(model.kind);
-    const dusk = warm ? ['#536C9A', '#9295B4', '#C1A59E'] : ['#687181', '#535D6C', '#424E5D'];
-    const dawn = warm ? ['#6B7DAB', '#AA9AB5', '#D5B7A8'] : ['#535D6C', '#627080', '#748392'];
-    colors = model.twilight.phase === 'dusk' ? dusk.map((c, i) => mix(c, night[i], t))
-      : dawn.map((c, i) => mix(c, (themes[model.kind] || themes.cloud)[i], t));
+    const dawn = model.twilight.phase === 'dawn', from = dawn ? night : day, to = dawn ? day : night;
+    if (['clear', 'partly'].includes(model.kind)) {
+      const middle = dawn ? ['#6B7DAB', '#AA9AB5', '#D5B7A8'] : ['#536C9A', '#9295B4', '#C1A59E'];
+      colors = t < .5 ? from.map((c,i)=>mix(c,middle[i],smooth(t*2))) : middle.map((c,i)=>mix(c,to[i],smooth((t-.5)*2)));
+    } else colors = from.map((c,i)=>mix(c,to[i],smooth(t)));
   }
   return { type: 'linear', colors, stops: [0, 0.56, 1],
     startPoint: { x: 0.5, y: 0 }, endPoint: { x: 0.5, y: 1 } };
@@ -391,14 +450,13 @@ function skyBackground(m, family) {
   const [w, h] = family === 'systemSmall' ? [164, 164] : family === 'systemLarge' ? [348, 366] : [348, 164];
   const gradient = themeFor(m);
   const stops = gradient.colors.map((color, i) => `<stop offset='${gradient.stops[i]}' stop-color='${color}'/>`).join('');
-  const twilight = m.twilight && ['clear', 'partly'].includes(m.kind);
-  const horizon = twilight ? '#F6D2B7' : m.isDay ? '#D9EAF4' : '#B8CDE9';
+  const horizon = '#D9EAF4';
   // 只绘制静态天色与柔和光照；系统圆角和材质仍交给 Egern / iOS。
   return svgData(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 ${w} ${h}'>
 <defs>
 <linearGradient id='sky' x1='0' y1='0' x2='0' y2='1'>${stops}</linearGradient>
-<radialGradient id='air'><stop stop-color='#FFFFFF' stop-opacity='${m.isDay ? 0.07 : 0.01}'/><stop offset='1' stop-color='#FFFFFF' stop-opacity='0'/></radialGradient>
-<radialGradient id='horizon'><stop stop-color='${horizon}' stop-opacity='${twilight ? 0.15 : m.isDay ? 0.045 : 0.01}'/><stop offset='1' stop-color='${horizon}' stop-opacity='0'/></radialGradient>
+<radialGradient id='air'><stop stop-color='#FFFFFF' stop-opacity='0.035'/><stop offset='1' stop-color='#FFFFFF' stop-opacity='0'/></radialGradient>
+<radialGradient id='horizon'><stop stop-color='${horizon}' stop-opacity='0.015'/><stop offset='1' stop-color='${horizon}' stop-opacity='0'/></radialGradient>
 </defs>
 <rect width='${w}' height='${h}' fill='url(#sky)'/>
 <ellipse cx='${w * 0.2}' cy='0' rx='${w * 0.9}' ry='${h * 0.8}' fill='url(#air)'/>
@@ -444,21 +502,14 @@ const lineHeight = size => Math.ceil(size * 1.2);
 function profileFor(family, stale) {
   const key = family === 'systemSmall' ? 'small' : family === 'systemLarge' ? 'large' : 'medium';
   const p = { ...UI[key] };
-  if (!stale) return p;
-  return { ...p, title: 14, temperature: key === 'large' ? 37 : 34, condition: 11,
-    rangeTemperature: 18, rangeLabel: 8, rangeBottom: 3,
-    mainIconWidth: 18, mainIconHeight: 15, hourLabel: 11, hourTemperature: 13, hourIconWidth: 20, hourIconHeight: 17 };
+  return p;
 }
 const text = (value, size = 12, extra = {}) => ({ type: 'text', text: String(value), font: { size, weight: 'regular' },
   textColor: UI.white, textAlign: 'left', maxLines: 1, minScale: 0.55, ...extra });
 const row = (children, extra = {}) => ({ type: 'stack', direction: 'row', alignItems: 'center', children, ...extra });
 const column = (children, extra = {}) => ({ type: 'stack', direction: 'column', alignItems: 'start', children, ...extra });
 const spacer = length => length === undefined ? { type: 'spacer' } : { type: 'spacer', length };
-const icon = (code, day, width, height = width, overview = false) => ({ type: 'image', ...iconSource(code, day, overview), width, height, resizeMode: 'contain' });
-const detailURL = `${H5}/h5`;
-// WidgetKit 先把点击 URL 交给宿主；使用 Egern 官方 x-success 回调转交网页。
-// connections 仅打开列表，不启动/停止 VPN，也不修改配置。
-const widgetTapURL = `egern:/connections?x-success=${encodeURIComponent(detailURL)}`;
+const icon = (code, day, width, height = width, overview = false, cloud) => ({ type: 'image', ...iconSource(code, day, overview, cloud), width, height, resizeMode: 'contain' });
 const leading = (node, height) => row([node, spacer()], { height });
 const trailing = (node, height) => row([spacer(), node], { height });
 const centered = (node, height) => row([spacer(), node, spacer()], { height });
@@ -486,7 +537,7 @@ function currentHeader(m, p) {
   const range = m.today ? todayRange(m, p) : null;
   const height = Math.max(lineHeight(p.title) + lineHeight(p.temperature),
     4 + p.mainIconHeight + 2 + lineHeight(p.condition) + (range ? lineHeight(p.rangeTemperature) + p.rangeBottom : 0));
-  const symbol = trailing(icon(m.code, m.isDay, p.mainIconWidth, p.mainIconHeight, true), p.mainIconHeight + 2);
+  const symbol = trailing(icon(m.code, m.isDay, p.mainIconWidth, p.mainIconHeight, true, m.cloud), p.mainIconHeight + 2);
   const description = trailing(text(m.label, p.condition, { textAlign: 'right' }), lineHeight(p.condition));
   const right = column([spacer(4), symbol, spacer(), description, ...(range ? [range, spacer(p.rangeBottom)] : [])],
     { width: p.rightWidth, height, alignItems: 'end' });
@@ -495,16 +546,16 @@ function currentHeader(m, p) {
 }
 function hourlyTimeline(m, p) {
   const labelHeight = lineHeight(p.hourLabel), temperatureHeight = lineHeight(p.hourTemperature);
-  const height = labelHeight + 4 + p.hourIconHeight + 3 + temperatureHeight;
+  const height = labelHeight + 2 + p.hourIconHeight + 1 + temperatureHeight;
   const slots = Array.from({ length: 6 }, (_, i) => m.hours[i] || { label: '—', missing: true, temperature: null });
   const columns = slots.map(h => column([
     centered(text(h.label, p.hourLabel, { font: { size: p.hourLabel, weight: 'medium' }, opacity: UI.secondary, textAlign: 'center' }), labelHeight),
-    spacer(4),
+    spacer(2),
     h.event ? solarIcon(h.event, p.hourIconWidth, p.hourIconHeight)
-      : h.missing ? centered(text('—', 13, { opacity: 0.5 }), p.hourIconHeight) : icon(h.code, h.day, p.hourIconWidth, p.hourIconHeight),
-    spacer(3),
-    centered(text(temperatureText(h.temperature), p.hourTemperature,
-      { font: { size: p.hourTemperature, weight: 'medium' }, textAlign: 'center' }), temperatureHeight),
+      : h.missing ? centered(text('—', 13, { opacity: 0.5 }), p.hourIconHeight) : icon(h.code, h.day, p.hourIconWidth, p.hourIconHeight, false, h.cloud),
+    spacer(1),
+    centered(text(h.event ? h.event === 'sunrise' ? '日出' : '日落' : temperatureText(h.temperature), h.event ? 11 : p.hourTemperature,
+      { font: { size: h.event ? 11 : p.hourTemperature, weight: 'medium' }, textAlign: 'center' }), temperatureHeight),
   ], { width: 28, alignItems: 'center' }));
   return row(columns.flatMap((c, i) => i ? [spacer(), c] : [c]), { height });
 }
@@ -514,26 +565,27 @@ function dailyCell(node, flex, align) {
 }
 function rangeBar(day, days) {
   const range = temperatureRange(day, days);
-  if (!range) return row([spacer()], { flex: 1, height: 4, backgroundColor: '#FFFFFF08', borderRadius: 2 });
+  if (!range) return row([spacer()], { flex: 1, height: 4, backgroundColor: '#00000014', borderRadius: 2 });
   const parts = [];
   if (range.before > 0) parts.push({ type: 'spacer', flex: range.before });
   parts.push(row([], { flex: range.span, height: 4, borderRadius: 2,
     backgroundGradient: { type: 'linear', colors: range.colors, stops: range.stops,
       startPoint: { x: 0, y: 0 }, endPoint: { x: 1, y: 0 } } }));
   if (range.after > 0) parts.push({ type: 'spacer', flex: range.after });
-  return row(parts, { flex: 1, height: 4 });
+  return row(parts, { flex: 1, height: 4, backgroundColor: '#00000014', borderRadius: 2 });
 }
 function dailyRows(m) {
   const children = [];
-  m.futureDays.forEach((d, i) => {
+  const days = m.notice ? m.futureDays.slice(0, 4) : m.futureDays;
+  days.forEach((d, i) => {
     children.push(row([
       dailyCell(text(d.label, 14, { font: { size: 14, weight: 'medium' } }), 1, 'start'),
       dailyCell(d.missing ? text('—', 13, { opacity: 0.4 }) : icon(d.code, true, 26, 24), 1, 'center'),
       dailyCell(text(temperatureText(d.low), 14, { font: { size: 14, weight: 'semibold' }, opacity: 0.38 }), 1.5, 'center'),
-      row([spacer(8), rangeBar(d, m.futureDays)], { flex: 2.4, height: 4 }),
+      row([spacer(8), rangeBar(d, days)], { flex: 2.4, height: 4 }),
       dailyCell(text(temperatureText(d.high), 14, { font: { size: 14, weight: 'semibold' }, textAlign: 'right' }), 0.7, 'end'),
     ], { height: 25 }));
-    if (i < m.futureDays.length - 1) children.push(spacer());
+    if (i < days.length - 1) children.push(spacer());
   });
   return children;
 }
@@ -542,35 +594,38 @@ function smallContent(m, p) {
     { type: 'spacer', flex: 1.5 },
     leading(text(m.title, p.title, { font: { size: p.title, weight: 'medium' } }), lineHeight(p.title)),
     leading(text(temperatureText(m.temperature), p.temperature, { font: { size: p.temperature, weight: 'light' } }), lineHeight(p.temperature)),
-    leading(icon(m.code, m.isDay, 18, 14, true), 14),
-    leading(text(m.label, p.condition), lineHeight(p.condition)),
+    leading(icon(m.code, m.isDay, 18, 14, true, m.cloud), 14),
+    m.stale ? row([text(m.label, p.condition), spacer(), text('上次更新', 7, { opacity: .8 }),
+      { type: 'date', date: new Date(m.fetchedAt).toISOString(), format: 'relative', font: { size: 7 }, textColor: '#FFFFFFCC', maxLines: 1, minScale: .5 }],
+      { height: lineHeight(p.condition), gap: 2 }) : leading(text(m.label, p.condition), lineHeight(p.condition)),
     spacer(),
     // 缺少范围时保留行高，避免标题和当前天气随数据缺失上下跳动。
     m.today ? todayRange(m, p, 'start') : spacer(lineHeight(p.rangeTemperature)),
-    ...(m.stale ? [updateLabel(m.fetchedAt)] : []),
     { type: 'spacer', flex: 1.3 },
   ];
 }
 function mediumContent(m, p) {
-  return [spacer(), currentHeader(m, p), spacer(3), hourlyTimeline(m, p),
-    ...(m.stale ? [updateLabel(m.fetchedAt)] : []), spacer()];
+  return [spacer(), currentHeader(m, p), spacer(2), hourlyTimeline(m, p),
+    m.stale ? updateLabel(m.fetchedAt) : spacer(12), spacer()];
 }
 function largeContent(m, p) {
   // 两条分隔线和五行预报；弹性间距在标准尺寸舒展，在紧凑尺寸自动收拢。
-  return [currentHeader(m, p), separator(), { type: 'spacer', flex: 2 }, hourlyTimeline(m, p),
+  return [currentHeader(m, p), separator(),
+    ...(m.notice ? [row([text(m.notice.text, 12, { minScale: .6 }), spacer()], { height: 25 }), separator()] : []),
+    { type: 'spacer', flex: 2 }, hourlyTimeline(m, p),
     { type: 'spacer', flex: 2.5 }, separator(), { type: 'spacer', flex: 2.75 }, ...dailyRows(m),
     { type: 'spacer', flex: 0.5 },
-    ...(m.stale ? [updateLabel(m.fetchedAt)] : [])];
+    m.stale ? updateLabel(m.fetchedAt) : spacer(12)];
 }
 export function renderWidget(m, family, config, refreshAt) {
   const p = profileFor(family, m.stale);
   const render = family === 'systemSmall' ? smallContent : family === 'systemLarge' ? largeContent : mediumContent;
   return { type: 'widget', padding: p.padding, gap: 0, backgroundGradient: themeFor(m), backgroundImage: skyBackground(m, family),
-    url: widgetTapURL, refreshAfter: new Date(Math.min(refreshAt, m.nextChangeAt ?? refreshAt)).toISOString(), children: render(m, p) };
+    refreshAfter: new Date(Math.min(refreshAt, m.nextChangeAt ?? refreshAt)).toISOString(), children: render(m, p) };
 }
 function messageWidget(config, family, message, refreshAt) {
   return { type: 'widget', padding: 12, backgroundGradient: themeFor({ isDay: false }),
-    refreshAfter: new Date(refreshAt).toISOString(), url: widgetTapURL,
+    refreshAfter: new Date(refreshAt).toISOString(),
     children: [text(config.title || config.region || '配置天气地区', 14), spacer(),
       text('—', 34), text(message, 11, { maxLines: family === 'systemSmall' ? 2 : 3, opacity: 0.85 }), spacer()] };
 }
