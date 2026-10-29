@@ -358,7 +358,8 @@ function svgData(markup) {
   }
   return `data:image/svg+xml;base64,${encoded}`;
 }
-const CLOUD = "<path d='M16 35C8 35 5 30 5 25S9 15 15 15C18 7 28 5 35 9C39 11 41 14 42 18C50 16 58 21 58 27C58 32 54 35 48 35Z' fill='#F3F7FC'/>";
+const CLOUD = "<path d='M16 35C8 35 5 30 5 23S9 12 15 12C17 2 28-1 36 4C41 7 43 12 43 17C51 15 58 21 58 27C58 32 54 35 48 35Z' fill='#F3F7FC'/>";
+const PARTLY_SUN = "<circle cx='49' cy='14' r='8' fill='#FFD330'/><path d='M49 2v2M49 24v3M36 14h3M59 14h3M40 5l2 2M57 22l2 2M58 5l-2 2M42 22l-2 2' fill='none' stroke='#FFD330' stroke-width='2.5' stroke-linecap='round'/>";
 function rainStrokes(code) {
   const styles = {
     LIGHT_RAIN: ['M20 42l-2 4M33 40l-2 4M46 42l-2 4', 2.5],
@@ -393,7 +394,7 @@ export function iconSource(code, day, overview = false, cloud) {
   if (kind === 'clear') body = day
     ? "<circle cx='32' cy='28' r='12' fill='#FFD879'/><path d='M32 5v5M32 46v5M9 28h5M50 28h5M16 12l4 4M44 40l4 4M48 12l-4 4M20 40l-4 4' stroke='#FFD879' stroke-width='3' stroke-linecap='round'/>"
     : "<path d='M39 6C17 5 9 30 24 44C35 54 53 47 57 36C39 42 26 20 39 6Z' fill='#F6F5ED'/>";
-  if (kind === 'partly' && !overview) body = (day ? "<circle cx='45' cy='14' r='11' fill='#FFD879'/>" : MOON) + CLOUD;
+  if (kind === 'partly' && !overview) body = (day ? PARTLY_SUN : MOON) + CLOUD;
   if (kind === 'rain') {
     // 云量缺失或厚云时采用普通雨云，不能仅凭夜间就画月牙。
     if (!day && needsCloud(code) && finite(cloud) && cloud <= .8) body = MOON + CLOUD;
@@ -490,13 +491,13 @@ const UI = Object.freeze({
   small: { padding: [7, 16, 7, 16], title: 15, temperature: 42, condition: 12,
     rangeTemperature: 24, rangeLabel: 9 },
   medium: { padding: [0, 16, 0, 16], title: 16, temperature: 44, condition: 14,
-    leftWidth: 120, rightWidth: 136, mainIconWidth: 20, mainIconHeight: 16,
+    leftWidth: 120, rightWidth: 136, mainIconWidth: 22, mainIconHeight: 18, inlineStatus: true,
     rangeTemperature: 24, rangeLabel: 9, rangeBottom: 4,
-    hourLabel: 12, hourTemperature: 14, hourIconWidth: 22, hourIconHeight: 19 },
+    hourLabel: 12, hourTemperature: 14, hourIconWidth: 26, hourIconHeight: 22 },
   large: { padding: 16, title: 17, temperature: 44, condition: 14,
     leftWidth: 124, rightWidth: 136, mainIconWidth: 22, mainIconHeight: 18,
     rangeTemperature: 24, rangeLabel: 9, rangeBottom: 4,
-    hourLabel: 12, hourTemperature: 14, hourIconWidth: 22, hourIconHeight: 19 },
+    hourLabel: 12, hourTemperature: 14, hourIconWidth: 26, hourIconHeight: 22 },
 });
 const lineHeight = size => Math.ceil(size * 1.2);
 function profileFor(family, stale) {
@@ -538,7 +539,11 @@ function currentHeader(m, p) {
   const height = Math.max(lineHeight(p.title) + lineHeight(p.temperature),
     4 + p.mainIconHeight + 2 + lineHeight(p.condition) + (range ? lineHeight(p.rangeTemperature) + p.rangeBottom : 0));
   const symbol = trailing(icon(m.code, m.isDay, p.mainIconWidth, p.mainIconHeight, true, m.cloud), p.mainIconHeight + 2);
-  const description = trailing(text(m.label, p.condition, { textAlign: 'right' }), lineHeight(p.condition));
+  const description = m.stale && p.inlineStatus
+    ? row([text('上次更新', 7, { opacity: .8 }),
+      { type: 'date', date: new Date(m.fetchedAt).toISOString(), format: 'relative', font: { size: 7 }, textColor: '#FFFFFFCC', maxLines: 1, minScale: .5 },
+      spacer(), text(m.label, p.condition, { textAlign: 'right', minScale: .4 })], { height: lineHeight(p.condition), gap: 2 })
+    : trailing(text(m.label, p.condition, { textAlign: 'right' }), lineHeight(p.condition));
   const right = column([spacer(4), symbol, spacer(), description, ...(range ? [range, spacer(p.rangeBottom)] : [])],
     { width: p.rightWidth, height, alignItems: 'end' });
   // 使用固定宽度、内部首尾 spacer；不让 flex frame 改变内容的实际对齐。
@@ -605,8 +610,7 @@ function smallContent(m, p) {
   ];
 }
 function mediumContent(m, p) {
-  return [spacer(), currentHeader(m, p), spacer(2), hourlyTimeline(m, p),
-    m.stale ? updateLabel(m.fetchedAt) : spacer(12), spacer()];
+  return [spacer(), currentHeader(m, p), spacer(2), hourlyTimeline(m, p), spacer()];
 }
 function largeContent(m, p) {
   // 两条分隔线和五行预报；弹性间距在标准尺寸舒展，在紧凑尺寸自动收拢。
