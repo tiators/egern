@@ -1,17 +1,17 @@
-name: 天气
-description: 查看指定地区的当前天气、小时趋势及五天预报。
+name: Weather
+description: Current weather, hourly outlook and a five-day forecast for your region.
 icon: cloud.sun.fill
 env_schema:
   REGION:
-    name: 天气地区
-    description: 必填完整市区名；示例只作提示，不会自动生效。
-    default_value: 杭州市西湖区
+    name: Weather region
+    description: Enter the full city and district name.
+    default_value: Xihu District, Hangzhou
   TITLE:
-    name: 显示名称
-    description: 可选；留空使用地理编码返回的地区名称。
+    name: Display name
+    description: Optional. Leave blank to use the name returned by geocoding.
   REFRESH_MINUTES:
-    name: 目标刷新间隔（分钟）
-    description: 默认 30 分钟；实际刷新由 iOS 调度。
+    name: Refresh interval (minutes)
+    description: Defaults to 30 minutes. Actual refresh timing is controlled by iOS.
     default_value: "30"
     options: ["15", "30", "60"]
 scriptings:
@@ -20,5 +20,5 @@ scriptings:
       script_url: https://raw.githubusercontent.com/tiators/egern/refs/heads/main/scripts/weather-widget.js
       timeout: 30
 widgets:
-  - name: 天气
+  - name: Weather
     script_name: weather

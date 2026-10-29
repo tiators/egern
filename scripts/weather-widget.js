@@ -1,6 +1,6 @@
-/** 天气 · Egern generic Widget · v1.0.0
- * 独立 ES module，无运行依赖。设置 REGION 即可使用。
- * 持久化仅两个固定键，总预算 4 KiB；ticket 仅存在于本次执行内存。
+/** Weather - Egern generic widget - v1.0.0
+ * Standalone ES module with no runtime dependencies. Set REGION to get started.
+ * Two fixed storage keys, limited to 4 KiB total. Tickets remain in memory.
  */
 const H5 = 'https://h5.caiyunapp.com';
 const GEO_URL = 'https://starplucker.cyapi.cn/v3/geo/geocode';
@@ -11,9 +11,9 @@ const HEADERS = {
 const MINUTE = 60000, HOUR = 60 * MINUTE, DAY = 24 * HOUR;
 const STALE_LIMIT = 6 * HOUR;
 const SNAPSHOT_VERSION = 4, FORECAST_DAYS = 5;
-// 固定槽名保持不变；内容版本独立升级，避免遗留第三条缓存记录。
+// Keep storage keys stable and version their contents to avoid orphaned records.
 export const CACHE_KEYS = Object.freeze({ geo: 'egern.weather.geo.v1', weather: 'egern.weather.snapshot.v1' });
-const LIMITS = { geo: 768, weather: 3328 }; // 包含键名的 UTF-8 字节数。
+const LIMITS = { geo: 768, weather: 3328 }; // UTF-8 byte limits, including key names.
 const finite = n => typeof n === 'number' && Number.isFinite(n);
 const numeric = n => (typeof n === 'number' || typeof n === 'string' && n.trim() !== '') && finite(Number(n)) ? Number(n) : null;
 const short = (s, n) => Array.from(typeof s === 'string' ? s : '').slice(0, n).join('');
@@ -52,7 +52,7 @@ export function utf8Bytes(s) {
   return bytes;
 }
 function remove(ctx, kind) {
-  try { ctx.storage?.delete(CACHE_KEYS[kind]); } catch (_) { /* 存储不可用不阻塞界面。 */ }
+  try { ctx.storage?.delete(CACHE_KEYS[kind]); } catch (_) { /* Storage errors must not block rendering. */ }
 }
 function read(ctx, kind, region) {
   try {
@@ -72,7 +72,7 @@ function write(ctx, kind, value) {
     if (utf8Bytes(CACHE_KEYS[kind]) + utf8Bytes(raw) > LIMITS[kind]) { remove(ctx, kind); return; }
     if (ctx.storage?.set) ctx.storage.set(CACHE_KEYS[kind], raw);
     else ctx.storage?.setJSON(CACHE_KEYS[kind], value);
-  } catch (_) { /* 仍可展示本次网络结果。 */ }
+  } catch (_) { /* The current network result can still be displayed. */ }
 }
 function validGeo(g) {
   return onlyKeys(g, ['version', 'region', 'name', 'lon', 'lat', 'at']) && finite(g.at) && finite(g.lon) && Math.abs(g.lon) <= 180
@@ -92,7 +92,7 @@ function validSnapshot(s, now) {
     && s.hours.every(h => onlyKeys(h, ['at', 'temperature', 'code', 'cloud']) && finite(h.at) && nullable(h.temperature) && typeof h.code === 'string' && validCloud(h))
     && (s.notice === undefined || onlyKeys(s.notice, ['text', 'until']) && typeof s.notice.text === 'string'
       && Array.from(s.notice.text).length <= 48 && finite(s.notice.until) && s.notice.until > s.fetchedAt && s.notice.until <= s.fetchedAt + 15 * MINUTE)
-    // 旧版今天起五天、未来四天均可读取；新快照保存明天起五天。
+    // Accept legacy daily ranges; new snapshots store five days starting tomorrow.
     && Array.isArray(s.days) && s.days.length <= FORECAST_DAYS
     && s.days.every(d => onlyKeys(d, ['date', 'low', 'high', 'code']) && isDate(d.date) && nullable(d.low) && nullable(d.high) && typeof d.code === 'string')
     && (s.today === undefined || s.today === null || onlyKeys(s.today, ['date', 'low', 'high']) && isDate(s.today.date)
@@ -107,27 +107,27 @@ function failureState(region, old, now) {
   return { ...base, version: SNAPSHOT_VERSION, failures, retryAt: now + [5, 15, 30][failures - 1] * MINUTE };
 }
 
-// ---------- 网络：请求预算统一管理，绝不输出带 ticket 的 URL ----------
+// ---------- Network: shared deadlines; never log URLs containing tickets ----------
 async function request(ctx, url, post, body, deadline, clock) {
   const remaining = deadline - clock();
-  if (remaining <= 0) throw new WeatherError('天气请求超时');
+  if (remaining <= 0) throw new WeatherError('Weather request timed out');
   const options = { headers: { ...HEADERS }, timeout: Math.min(7000, remaining) };
   if (post) options.body = body === undefined ? '' : JSON.stringify(body);
   if (body !== undefined) options.headers['Content-Type'] = 'application/json';
   let response;
   try { response = await ctx.http[post ? 'post' : 'get'](url, options); }
-  catch (_) { throw new WeatherError('网络连接失败'); }
-  if (clock() >= deadline) throw new WeatherError('天气请求超时');
+  catch (_) { throw new WeatherError('Network unavailable'); }
+  if (clock() >= deadline) throw new WeatherError('Weather request timed out');
   const status = Number(response.status);
-  if (status === 401 || status === 403) throw new WeatherError('临时认证失败', true);
-  if (!finite(status) || status < 200 || status >= 300) throw new WeatherError('天气服务暂不可用');
+  if (status === 401 || status === 403) throw new WeatherError('Authentication failed', true);
+  if (!finite(status) || status < 200 || status >= 300) throw new WeatherError('Weather service unavailable');
   let data;
-  try { data = await response.json(); } catch (_) { throw new WeatherError('服务未返回有效数据'); }
-  if (clock() >= deadline) throw new WeatherError('天气请求超时');
-  if (!data || typeof data !== 'object') throw new WeatherError('天气数据格式异常');
+  try { data = await response.json(); } catch (_) { throw new WeatherError('Invalid weather response'); }
+  if (clock() >= deadline) throw new WeatherError('Weather request timed out');
+  if (!data || typeof data !== 'object') throw new WeatherError('Invalid weather data');
   if ([401, 403].includes(Number(data.statusCode))
     || /invalid ticket|ticket expired|expired ticket|auth failed|unauthorized/i.test(String(data.message || data.error || ''))) {
-    throw new WeatherError('临时认证已失效', true);
+    throw new WeatherError('Authentication expired', true);
   }
   return data;
 }
@@ -137,13 +137,13 @@ async function coordinates(ctx, config, cached, deadline, clock) {
   const p = data.items?.[0];
   const geo = { version: 1, region: config.region, name: short(p?.name, 80) || short(config.region, 80),
     lon: numeric(p?.longitude), lat: numeric(p?.latitude), at: clock() };
-  if (!validGeo(geo)) throw new WeatherError('未找到地区，请填写完整市区名');
+  if (!validGeo(geo)) throw new WeatherError('Region not found. Use a full city/district name.');
   write(ctx, 'geo', geo);
   return geo;
 }
 async function ticket(ctx, deadline, clock) {
   const data = await request(ctx, `${H5}/api/ticket`, true, undefined, deadline, clock);
-  if (typeof data.ticket !== 'string' || !data.ticket.trim()) throw new WeatherError('未获得临时认证');
+  if (typeof data.ticket !== 'string' || !data.ticket.trim()) throw new WeatherError('Authentication unavailable');
   return data.ticket;
 }
 async function fetchWeather(ctx, geo, deadline, clock) {
@@ -158,7 +158,7 @@ async function fetchWeather(ctx, geo, deadline, clock) {
   }
 }
 
-// ---------- 只把显示需要的数据转换成快照 ----------
+// ---------- Normalize only the data needed for display ----------
 export function localParts(ms, meta) {
   try {
     if (meta.timezone && typeof Intl !== 'undefined') {
@@ -167,7 +167,7 @@ export function localParts(ms, meta) {
       const p = Object.fromEntries(parts.map(v => [v.type, v.value]));
       return { date: `${p.year}-${p.month}-${p.day}`, hour: Number(p.hour) % 24, minute: Number(p.minute), second: Number(p.second) };
     }
-  } catch (_) { /* JSCore 不支持时区时回退到服务端偏移。 */ }
+  } catch (_) { /* Fall back to the server offset when JSCore cannot resolve the time zone. */ }
   const d = new Date(ms + meta.shift * 1000);
   return { date: d.toISOString().slice(0, 10), hour: d.getUTCHours(), minute: d.getUTCMinutes(), second: d.getUTCSeconds() };
 }
@@ -195,20 +195,20 @@ function dailyTemperatures(value) {
   return { low, high };
 }
 function todayTemperatures(s, date) {
-  // 旧五天快照可直接提供今日范围；旧四天快照缺少此数据时由入口补取。
+  // Reuse today from legacy snapshots; the entry point refreshes incomplete records.
   const d = s.today?.date === date ? s.today : s.days.find(d => d.date === date);
   return finite(d?.low) || finite(d?.high) ? { date, low: d.low ?? null, high: d.high ?? null } : null;
 }
 export function normalizeWeather(data, region, now) {
   const r = data?.result, current = r?.realtime;
   if (data?.status !== 'ok' || current?.status !== 'ok' || numeric(current.temperature) === null) {
-    throw new WeatherError('当前天气暂不可用');
+    throw new WeatherError('Current weather unavailable');
   }
   const shift = numeric(data.tzshift);
   const snapshot = { version: SNAPSHOT_VERSION, region, fetchedAt: now, sourceAt: numeric(data.server_time),
     timezone: short(data.timezone, 64), shift: shift !== null && Math.abs(shift) <= 86400 ? shift : 28800,
     current: { temperature: numeric(current.temperature), code: codeOf(current.skycon) },
-    // null 表示本次已查询但无今日范围；字段缺失才表示旧快照尚未查询。
+    // Null means the range was requested but unavailable; an absent field marks legacy data.
     hours: [], days: [], today: null, astro: [], failures: 0, retryAt: 0 };
   const today = localParts(now, snapshot).date;
   const currentCloud = cloudValue(current.cloudrate);
@@ -218,7 +218,7 @@ export function normalizeWeather(data, region, now) {
   const ht = rows(hourly.temperature, 'datetime', true), hs = rows(hourly.skycon, 'datetime', true);
   const hc = rows(hourly.cloudrate, 'datetime', true);
   const floor = hourFloor(now, snapshot);
-  // 六个未来整点加一个跨整点备用值，最大刷新间隔为一小时。
+  // Keep six future hours plus one spare to cover the maximum one-hour refresh interval.
   for (let i = 1; i <= 7; i++) {
     const at = floor + i * HOUR;
     if (ht.has(at) || hs.has(at)) {
@@ -238,7 +238,7 @@ export function normalizeWeather(data, region, now) {
       snapshot.days.push({ date, low, high, code: codeOf(ds.get(date)?.value) });
     }
   }
-  // 天文数据与逐日温度分别裁剪，仍保留今明两天以判断昼夜和暮光。
+  // Keep astronomy for today and tomorrow independently of the daily temperature range.
   for (let i = 0; i < 2; i++) {
     const date = nextDate(today, i);
     if (da.has(date)) {
@@ -248,9 +248,9 @@ export function normalizeWeather(data, region, now) {
   }
   const minute = r.minutely;
   const description = typeof minute?.description === 'string' ? minute.description.replace(/[\r\n\t]/g, ' ').trim() : '';
-  // 只保留确有降水时的短时描述，15 分钟后隐藏；不保存分钟数组或推算概率。
+  // Keep a short notice only when precipitation is forecast; expire it after 15 minutes.
   if (minute?.status === 'ok' && description && Array.from(description).length <= 48
-    && /雨|雪/.test(description) && Array.isArray(minute.precipitation) && minute.precipitation.some(n => finite(n) && n > 0)) {
+    && Array.isArray(minute.precipitation) && minute.precipitation.some(n => finite(n) && n > 0)) {
     snapshot.notice = { text: description, until: now + 15 * MINUTE };
   }
   return snapshot;
@@ -270,21 +270,21 @@ function daytime(at, snapshot, code) {
 }
 export function condition(code) {
   const known = {
-    CLEAR_DAY: ['晴', 'clear'], CLEAR_NIGHT: ['晴', 'clear'], PARTLY_CLOUDY_DAY: ['多云', 'partly'], PARTLY_CLOUDY_NIGHT: ['多云', 'partly'], CLOUDY: ['阴', 'cloud'],
-    LIGHT_RAIN: ['小雨', 'rain'], MODERATE_RAIN: ['中雨', 'rain'], HEAVY_RAIN: ['大雨', 'rain'], STORM_RAIN: ['暴雨', 'rain'], RAIN: ['雨', 'rain'],
-    LIGHT_SNOW: ['小雪', 'snow'], MODERATE_SNOW: ['中雪', 'snow'], HEAVY_SNOW: ['大雪', 'snow'], STORM_SNOW: ['暴雪', 'snow'], SNOW: ['雪', 'snow'],
-    SLEET: ['雨夹雪', 'mixed'], RAIN_SNOW: ['雨夹雪', 'mixed'], HAIL: ['冰雹', 'hail'], FREEZING_RAIN: ['冻雨', 'ice'], FREEZING_DRIZZLE: ['冻毛毛雨', 'ice'],
-    LIGHT_HAZE: ['轻度雾霾', 'haze'], MODERATE_HAZE: ['中度雾霾', 'haze'], HEAVY_HAZE: ['重度雾霾', 'haze'],
-    FOG: ['雾', 'fog'], DUST: ['浮尘', 'haze'], SAND: ['沙尘', 'haze'], WIND: ['大风', 'wind'], THUNDER_SHOWER: ['雷阵雨', 'storm'],
+    CLEAR_DAY: ['Clear', 'clear'], CLEAR_NIGHT: ['Clear', 'clear'], PARTLY_CLOUDY_DAY: ['Partly cloudy', 'partly'], PARTLY_CLOUDY_NIGHT: ['Partly cloudy', 'partly'], CLOUDY: ['Overcast', 'cloud'],
+    LIGHT_RAIN: ['Light rain', 'rain'], MODERATE_RAIN: ['Moderate rain', 'rain'], HEAVY_RAIN: ['Heavy rain', 'rain'], STORM_RAIN: ['Heavy downpour', 'rain'], RAIN: ['Rain', 'rain'],
+    LIGHT_SNOW: ['Light snow', 'snow'], MODERATE_SNOW: ['Moderate snow', 'snow'], HEAVY_SNOW: ['Heavy snow', 'snow'], STORM_SNOW: ['Blizzard', 'snow'], SNOW: ['Snow', 'snow'],
+    SLEET: ['Sleet', 'mixed'], RAIN_SNOW: ['Sleet', 'mixed'], HAIL: ['Hail', 'hail'], FREEZING_RAIN: ['Freezing rain', 'ice'], FREEZING_DRIZZLE: ['Freezing drizzle', 'ice'],
+    LIGHT_HAZE: ['Light haze', 'haze'], MODERATE_HAZE: ['Moderate haze', 'haze'], HEAVY_HAZE: ['Heavy haze', 'haze'],
+    FOG: ['Fog', 'fog'], DUST: ['Dust', 'haze'], SAND: ['Blowing dust', 'haze'], WIND: ['Windy', 'wind'], THUNDER_SHOWER: ['Thunderstorms', 'storm'],
   };
-  const [label, kind] = known[code] || ['天气未知', 'unknown'];
+  const [label, kind] = known[code] || ['Unknown', 'unknown'];
   return { label, kind };
 }
 function localTimeAt(date, minute, meta) {
   if (!isDate(date) || !finite(minute) || minute < 0 || minute >= 1440) return null;
   const wall = Date.parse(`${date}T00:00:00Z`) + minute * MINUTE;
   let at = wall - meta.shift * 1000;
-  // 从地区墙上时间反解时间戳；跨夏令时切换时不能直接加到当前时刻。
+  // Resolve local wall time to a timestamp without assuming a fixed offset across DST.
   for (let i = 0; i < 4; i++) {
     const p = localParts(at, meta);
     const actual = Date.parse(`${p.date}T00:00:00Z`) + (p.hour * 60 + p.minute) * MINUTE + p.second * 1000;
@@ -313,7 +313,7 @@ function solarTimeline(s, now, hours) {
       const at = localTimeAt(a.date, minute, s);
       if (at === null || at <= now || at > last) continue;
       const p = localParts(at, s);
-      // 接口没有分钟温度；该列明确显示日出/日落名称，不借用整点温度。
+      // No minute temperatures are available; show the solar event name instead.
       events.push({ at, event, temperature: null, missing: false,
         label: `${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')}` });
     }
@@ -328,11 +328,11 @@ export function viewModel(s, config, geo, now, stale = false) {
   for (let i = 1; i <= 6; i++) {
     const at = floor + i * HOUR, h = byHour.get(at);
     hours.push({ at, temperature: h?.temperature ?? null, code: h?.code || 'UNKNOWN', cloud: h?.cloud,
-      label: `${localParts(at, s).hour}时`, day: daytime(at, s, h?.code || ''), missing: !h });
+      label: `${localParts(at, s).hour}:00`, day: daytime(at, s, h?.code || ''), missing: !h });
   }
   const futureDays = Array.from({ length: FORECAST_DAYS }, (_, i) => {
     const date = nextDate(today, i + 1), d = s.days.find(d => d.date === date);
-    const label = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(`${date}T12:00:00Z`).getUTCDay()];
+    const label = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][new Date(`${date}T12:00:00Z`).getUTCDay()];
     return { date, label, low: d?.low ?? null, high: d?.high ?? null, code: d?.code || 'UNKNOWN', missing: !d };
   });
   const timeline = solarTimeline(s, now, hours);
@@ -346,9 +346,9 @@ export function viewModel(s, config, geo, now, stale = false) {
     isDay: daytime(now, s, s.current.code), twilight, stale, fetchedAt: s.fetchedAt };
 }
 
-// ---------- 图标：组合图标为内置 SVG，简单图标使用 SF Symbols ----------
+// ---------- Icons: embedded SVG artwork on a shared canvas ----------
 function svgData(markup) {
-  // SVG 只含 ASCII；独立编码以兼容不提供 btoa 的 JSCore。
+  // Encode ASCII SVG directly for JSCore environments without btoa.
   const abc = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   let encoded = '';
   for (let i = 0; i < markup.length; i += 3) {
@@ -367,7 +367,7 @@ function rainStrokes(code) {
     HEAVY_RAIN: ['M16 39l-4 12M27 39l-4 12M38 39l-4 12M49 39l-4 12', 3.5],
     STORM_RAIN: ['M13 39l-4 12M21 39l-4 12M29 39l-4 12M37 39l-4 12M45 39l-4 12M53 39l-4 12', 4],
   };
-  // 未分级的雨保留通用图标；仅用天气码区分强度，不推算降雨量。
+  // Use a generic icon for unclassified rain; do not infer rainfall amounts.
   const [path, width] = styles[code] || ['M21 41l-3 7M33 41l-3 7M45 41l-3 7', 3];
   return `<path d='${path}' fill='none' stroke='#42CAE6' stroke-width='${width}' stroke-linecap='round'/>`;
 }
@@ -396,7 +396,7 @@ export function iconSource(code, day, overview = false, cloud) {
     : "<path d='M39 6C17 5 9 30 24 44C35 54 53 47 57 36C39 42 26 20 39 6Z' fill='#F6F5ED'/>";
   if (kind === 'partly' && !overview) body = (day ? PARTLY_SUN : MOON) + CLOUD;
   if (kind === 'rain') {
-    // 云量缺失或厚云时采用普通雨云，不能仅凭夜间就画月牙。
+    // Show a plain rain cloud when cloud cover is unknown or overcast.
     if (!day && needsCloud(code) && finite(cloud) && cloud <= .8) body = MOON + CLOUD;
     body += rainStrokes(code);
   }
@@ -452,7 +452,7 @@ function skyBackground(m, family) {
   const gradient = themeFor(m);
   const stops = gradient.colors.map((color, i) => `<stop offset='${gradient.stops[i]}' stop-color='${color}'/>`).join('');
   const horizon = '#D9EAF4';
-  // 只绘制静态天色与柔和光照；系统圆角和材质仍交给 Egern / iOS。
+  // Draw a static sky with soft lighting; Egern and iOS control system corners and materials.
   return svgData(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 ${w} ${h}'>
 <defs>
 <linearGradient id='sky' x1='0' y1='0' x2='0' y2='1'>${stops}</linearGradient>
@@ -485,7 +485,7 @@ export function temperatureRange(day, days) {
     stops: day.low === day.high ? [0, 1] : points.map(t => (t - day.low) / (day.high - day.low)) };
 }
 
-// ---------- UI：以用户当前实机截图为基准，三尺寸共用排版组件 ----------
+// ---------- UI: shared layouts calibrated against device screenshots ----------
 const UI = Object.freeze({
   white: '#FFFFFF', secondary: 0.82,
   small: { padding: [7, 16, 7, 16], title: 15, temperature: 42, condition: 12,
@@ -518,16 +518,16 @@ function separator() {
   return row([spacer()], { height: 0.5, backgroundColor: '#FFFFFF26' });
 }
 function updateLabel(at) {
-  return row([text('上次更新', 9, { opacity: 0.8 }), { type: 'date', date: new Date(at).toISOString(), format: 'relative',
+  return row([text('Updated', 9, { opacity: 0.8 }), { type: 'date', date: new Date(at).toISOString(), format: 'relative',
     font: { size: 9 }, textColor: '#FFFFFFCC', textAlign: 'left', maxLines: 1, minScale: 0.5 }, spacer()], { gap: 3, height: 12 });
 }
 function todayRange(m, p, align = 'end') {
-  const label = last => column([text('最', p.rangeLabel), text(last, p.rangeLabel)],
-    { width: p.rangeLabel, alignItems: 'center' });
+  const label = value => column([text(value, p.rangeLabel)],
+    { width: p.rangeLabel * 1.3, alignItems: 'start' });
   const value = n => text(temperatureText(n), p.rangeTemperature,
     { font: { size: p.rangeTemperature, weight: 'light' }, textAlign: 'right' });
-  const values = [label('高'), value(m.today.high), spacer(5), label('低'), value(m.today.low)];
-  // 小号靠左排，中大号靠右排；温度过长时在可用行宽内缩小。
+  const values = [label('H:'), value(m.today.high), spacer(5), label('L:'), value(m.today.low)];
+  // Align small widgets left and larger widgets right; scale long values to fit.
   return row(align === 'start' ? [...values, spacer()] : [spacer(), ...values],
     { ...(align === 'end' ? { width: p.rightWidth } : {}), height: lineHeight(p.rangeTemperature), gap: 1 });
 }
@@ -540,13 +540,13 @@ function currentHeader(m, p) {
     4 + p.mainIconHeight + 2 + lineHeight(p.condition) + (range ? lineHeight(p.rangeTemperature) + p.rangeBottom : 0));
   const symbol = trailing(icon(m.code, m.isDay, p.mainIconWidth, p.mainIconHeight, true, m.cloud), p.mainIconHeight + 2);
   const description = m.stale && p.inlineStatus
-    ? row([text('上次更新', 7, { opacity: .8 }),
+    ? row([text('Updated', 7, { opacity: .8 }),
       { type: 'date', date: new Date(m.fetchedAt).toISOString(), format: 'relative', font: { size: 7 }, textColor: '#FFFFFFCC', maxLines: 1, minScale: .5 },
       spacer(), text(m.label, p.condition, { textAlign: 'right', minScale: .4 })], { height: lineHeight(p.condition), gap: 2 })
     : trailing(text(m.label, p.condition, { textAlign: 'right' }), lineHeight(p.condition));
   const right = column([spacer(4), symbol, spacer(), description, ...(range ? [range, spacer(p.rangeBottom)] : [])],
     { width: p.rightWidth, height, alignItems: 'end' });
-  // 使用固定宽度、内部首尾 spacer；不让 flex frame 改变内容的实际对齐。
+  // Fixed widths and edge spacers keep content aligned inside flexible frames.
   return row([left, spacer(), right], { height, alignItems: 'start' });
 }
 function hourlyTimeline(m, p) {
@@ -559,7 +559,7 @@ function hourlyTimeline(m, p) {
     h.event ? solarIcon(h.event, p.hourIconWidth, p.hourIconHeight)
       : h.missing ? centered(text('—', 13, { opacity: 0.5 }), p.hourIconHeight) : icon(h.code, h.day, p.hourIconWidth, p.hourIconHeight, false, h.cloud),
     spacer(1),
-    centered(text(h.event ? h.event === 'sunrise' ? '日出' : '日落' : temperatureText(h.temperature), h.event ? 11 : p.hourTemperature,
+    centered(text(h.event ? h.event === 'sunrise' ? 'Sunrise' : 'Sunset' : temperatureText(h.temperature), h.event ? 11 : p.hourTemperature,
       { font: { size: h.event ? 11 : p.hourTemperature, weight: 'medium' }, textAlign: 'center' }), temperatureHeight),
   ], { width: 28, alignItems: 'center' }));
   return row(columns.flatMap((c, i) => i ? [spacer(), c] : [c]), { height });
@@ -600,11 +600,11 @@ function smallContent(m, p) {
     leading(text(m.title, p.title, { font: { size: p.title, weight: 'medium' } }), lineHeight(p.title)),
     leading(text(temperatureText(m.temperature), p.temperature, { font: { size: p.temperature, weight: 'light' } }), lineHeight(p.temperature)),
     leading(icon(m.code, m.isDay, 18, 14, true, m.cloud), 14),
-    m.stale ? row([text(m.label, p.condition), spacer(), text('上次更新', 7, { opacity: .8 }),
+    m.stale ? row([text(m.label, p.condition), spacer(), text('Updated', 7, { opacity: .8 }),
       { type: 'date', date: new Date(m.fetchedAt).toISOString(), format: 'relative', font: { size: 7 }, textColor: '#FFFFFFCC', maxLines: 1, minScale: .5 }],
       { height: lineHeight(p.condition), gap: 2 }) : leading(text(m.label, p.condition), lineHeight(p.condition)),
     spacer(),
-    // 缺少范围时保留行高，避免标题和当前天气随数据缺失上下跳动。
+    // Preserve row height when the range is missing to prevent vertical layout shifts.
     m.today ? todayRange(m, p, 'start') : spacer(lineHeight(p.rangeTemperature)),
     { type: 'spacer', flex: 1.3 },
   ];
@@ -613,7 +613,7 @@ function mediumContent(m, p) {
   return [spacer(), currentHeader(m, p), spacer(2), hourlyTimeline(m, p), spacer()];
 }
 function largeContent(m, p) {
-  // 两条分隔线和五行预报；弹性间距在标准尺寸舒展，在紧凑尺寸自动收拢。
+  // Flexible spacing fits the forecast rows on both standard and compact widgets.
   return [currentHeader(m, p), separator(),
     ...(m.notice ? [row([text(m.notice.text, 12, { minScale: .6 }), spacer()], { height: 25 }), separator()] : []),
     { type: 'spacer', flex: 2 }, hourlyTimeline(m, p),
@@ -630,15 +630,15 @@ export function renderWidget(m, family, config, refreshAt) {
 function messageWidget(config, family, message, refreshAt) {
   return { type: 'widget', padding: 12, backgroundGradient: themeFor({ isDay: false }),
     refreshAfter: new Date(refreshAt).toISOString(),
-    children: [text(config.title || config.region || '配置天气地区', 14), spacer(),
+    children: [text(config.title || config.region || 'Set weather region', 14), spacer(),
       text('—', 34), text(message, 11, { maxLines: family === 'systemSmall' ? 2 : 3, opacity: 0.85 }), spacer()] };
 }
 
-// clock 参数仅用于开发测试；Egern 使用下方默认导出，时钟为 Date.now。
+// The injected clock is for tests; Egern uses the default export with Date.now.
 export async function runWidget(ctx, clock = Date.now) {
   const config = settings(ctx.env), family = ctx.widgetFamily || 'systemSmall', now = clock();
-  if (!['systemSmall', 'systemMedium', 'systemLarge'].includes(family)) return messageWidget(config, family, '请选择主屏幕小、中或大尺寸', now + 30 * MINUTE);
-  if (!config.region || Array.from(config.region).length > 120) return messageWidget(config, family, '请在 REGION 填写完整市区名', now + 30 * MINUTE);
+  if (!['systemSmall', 'systemMedium', 'systemLarge'].includes(family)) return messageWidget(config, family, 'Choose a small, medium or large Home Screen widget', now + 30 * MINUTE);
+  if (!config.region || Array.from(config.region).length > 120) return messageWidget(config, family, 'Set REGION to a full city/district name', now + 30 * MINUTE);
   let geo = read(ctx, 'geo', config.region), snapshot = read(ctx, 'weather', config.region);
   if (!validGeo(geo) || geo.at > now) { remove(ctx, 'geo'); geo = null; }
   if (!validSnapshot(snapshot, now)) { remove(ctx, 'weather'); snapshot = null; }
@@ -654,7 +654,7 @@ export async function runWidget(ctx, clock = Date.now) {
   }
   if (snapshot?.retryAt > now) {
     return snapshot.current ? renderWidget(viewModel(snapshot, config, geo, now, true), family, config, snapshot.retryAt)
-      : messageWidget(config, family, '天气暂不可用，稍后重试', snapshot.retryAt);
+      : messageWidget(config, family, 'Weather unavailable. Try again later.', snapshot.retryAt);
   }
   try {
     const deadline = now + 25000;
@@ -668,7 +668,7 @@ export async function runWidget(ctx, clock = Date.now) {
     snapshot = failureState(config.region, snapshot, failedAt);
     write(ctx, 'weather', snapshot);
     return snapshot.current ? renderWidget(viewModel(snapshot, config, geo, failedAt, true), family, config, snapshot.retryAt)
-      : messageWidget(config, family, error instanceof WeatherError ? error.message : '天气暂不可用', snapshot.retryAt);
+      : messageWidget(config, family, error instanceof WeatherError ? error.message : 'Weather unavailable', snapshot.retryAt);
   }
 }
 export default async function(ctx) { return runWidget(ctx); }
