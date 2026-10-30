@@ -17,17 +17,20 @@ const LIMITS = { geo: 768, weather: 3328 }; // UTF-8 byte limits, including key 
 const finite = n => typeof n === 'number' && Number.isFinite(n);
 const numeric = n => (typeof n === 'number' || typeof n === 'string' && n.trim() !== '') && finite(Number(n)) ? Number(n) : null;
 const short = (s, n) => Array.from(typeof s === 'string' ? s : '').slice(0, n).join('');
-const codeOf = s => typeof s === 'string' && /^[A-Z_]{1,32}$/.test(s) ? s : 'UNKNOWN';
+const isCode = s => typeof s === 'string' && /^[A-Z_]{1,32}$/.test(s);
+const codeOf = s => isCode(s) ? s : 'UNKNOWN';
 const needsCloud = code => ['LIGHT_RAIN', 'MODERATE_RAIN'].includes(code);
 const cloudValue = value => {
   const n = numeric(value);
-  return n !== null && n >= 0 && n <= 1 ? Math.round(n * 100) / 100 : null;
+  // Round upward so overcast values just above 0.8 cannot become partly cloudy.
+  return n !== null && n >= 0 && n <= 1 ? Math.ceil(n * 100) / 100 : null;
 };
 const onlyKeys = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).every(key => keys.includes(key));
 const ageWithin = (at, duration, now) => finite(at) && at <= now && now - at < duration;
 const isDate = s => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s)
   && finite(Date.parse(s)) && new Date(s).toISOString().slice(0, 10) === s;
+const uniqueBy = (items, key) => new Set(items.map(item => item[key])).size === items.length;
 const nextDate = (date, offset) => new Date(Date.parse(`${date}T12:00:00Z`) + offset * DAY).toISOString().slice(0, 10);
 export const temperatureText = n => finite(n) ? `${Math.round(n) || 0}°` : '—';
 
@@ -84,22 +87,26 @@ function validSnapshot(s, now) {
     || !finite(s.retryAt) || s.retryAt < 0 || s.retryAt > now + 30 * MINUTE) return false;
   if (s.fetchedAt === undefined) return s.failures > 0 && onlyKeys(s, ['version', 'region', 'failures', 'retryAt']);
   const nullable = n => n === null || finite(n);
+  const validMinute = n => n === null || Number.isInteger(n) && n >= 0 && n < 1440;
   const validCloud = h => h.cloud === undefined || needsCloud(h.code) && finite(h.cloud) && h.cloud >= 0 && h.cloud <= 1;
   return finite(s.fetchedAt) && s.fetchedAt <= now && nullable(s.sourceAt)
     && typeof s.timezone === 'string' && finite(s.shift) && Math.abs(s.shift) <= 86400
-    && onlyKeys(s.current, ['temperature', 'code', 'cloud']) && finite(s.current?.temperature) && typeof s.current?.code === 'string' && validCloud(s.current)
+    && onlyKeys(s.current, ['temperature', 'code', 'cloud']) && finite(s.current?.temperature) && isCode(s.current.code) && validCloud(s.current)
     && Array.isArray(s.hours) && s.hours.length <= 7
-    && s.hours.every(h => onlyKeys(h, ['at', 'temperature', 'code', 'cloud']) && finite(h.at) && nullable(h.temperature) && typeof h.code === 'string' && validCloud(h))
+    && s.hours.every(h => onlyKeys(h, ['at', 'temperature', 'code', 'cloud']) && finite(h.at) && Math.abs(h.at) <= 8.64e15
+      && nullable(h.temperature) && isCode(h.code) && validCloud(h)) && uniqueBy(s.hours, 'at')
     && (s.notice === undefined || onlyKeys(s.notice, ['text', 'until']) && typeof s.notice.text === 'string'
       && Array.from(s.notice.text).length <= 48 && finite(s.notice.until) && s.notice.until > s.fetchedAt && s.notice.until <= s.fetchedAt + 15 * MINUTE)
     // Accept legacy daily ranges; new snapshots store five days starting tomorrow.
     && Array.isArray(s.days) && s.days.length <= FORECAST_DAYS
-    && s.days.every(d => onlyKeys(d, ['date', 'low', 'high', 'code']) && isDate(d.date) && nullable(d.low) && nullable(d.high) && typeof d.code === 'string')
+    && s.days.every(d => onlyKeys(d, ['date', 'low', 'high', 'code']) && isDate(d.date) && nullable(d.low) && nullable(d.high)
+      && (d.low === null || d.high === null || d.low <= d.high) && isCode(d.code)) && uniqueBy(s.days, 'date')
     && (s.today === undefined || s.today === null || onlyKeys(s.today, ['date', 'low', 'high']) && isDate(s.today.date)
       && nullable(s.today.low) && nullable(s.today.high) && (finite(s.today.low) || finite(s.today.high))
       && (s.today.low === null || s.today.high === null || s.today.low <= s.today.high))
     && Array.isArray(s.astro) && s.astro.length <= 2
-    && s.astro.every(a => onlyKeys(a, ['date', 'rise', 'set']) && isDate(a.date) && nullable(a.rise) && nullable(a.set));
+    && s.astro.every(a => onlyKeys(a, ['date', 'rise', 'set']) && isDate(a.date) && validMinute(a.rise) && validMinute(a.set))
+    && uniqueBy(s.astro, 'date');
 }
 function failureState(region, old, now) {
   const failures = Math.min(3, (old?.failures || 0) + 1);
@@ -159,13 +166,22 @@ async function fetchWeather(ctx, geo, deadline, clock) {
 }
 
 // ---------- Normalize only the data needed for display ----------
+// Reuse one formatter in memory; neither formatters nor invalid-zone results are persisted.
+let formatterZone, zoneFormatter;
 export function localParts(ms, meta) {
   try {
     if (meta.timezone && typeof Intl !== 'undefined') {
-      const parts = new Intl.DateTimeFormat('en-GB', { timeZone: meta.timezone, year: 'numeric', month: '2-digit',
-        day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }).formatToParts(new Date(ms));
-      const p = Object.fromEntries(parts.map(v => [v.type, v.value]));
-      return { date: `${p.year}-${p.month}-${p.day}`, hour: Number(p.hour) % 24, minute: Number(p.minute), second: Number(p.second) };
+      if (formatterZone !== meta.timezone) {
+        formatterZone = meta.timezone;
+        zoneFormatter = null;
+        zoneFormatter = new Intl.DateTimeFormat('en-GB', { timeZone: meta.timezone, year: 'numeric', month: '2-digit',
+          day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+      }
+      if (zoneFormatter) {
+        const parts = zoneFormatter.formatToParts(new Date(ms));
+        const p = Object.fromEntries(parts.map(v => [v.type, v.value]));
+        return { date: `${p.year}-${p.month}-${p.day}`, hour: Number(p.hour) % 24, minute: Number(p.minute), second: Number(p.second) };
+      }
     }
   } catch (_) { /* Fall back to the server offset when JSCore cannot resolve the time zone. */ }
   const d = new Date(ms + meta.shift * 1000);
@@ -185,7 +201,7 @@ function rows(values, field, hourly) {
   return map;
 }
 function minutes(value) {
-  if (!/^\d{2}:\d{2}$/.test(value || '')) return null;
+  if (typeof value !== 'string' || !/^\d{2}:\d{2}$/.test(value)) return null;
   const [h, m] = value.split(':').map(Number);
   return h < 24 && m < 60 ? h * 60 + m : null;
 }
@@ -277,7 +293,8 @@ export function condition(code) {
     LIGHT_HAZE: ['轻度雾霾', 'haze'], MODERATE_HAZE: ['中度雾霾', 'haze'], HEAVY_HAZE: ['重度雾霾', 'haze'],
     FOG: ['雾', 'fog'], DUST: ['浮尘', 'haze'], SAND: ['沙尘', 'haze'], WIND: ['大风', 'wind'], THUNDER_SHOWER: ['雷阵雨', 'storm'],
   };
-  const [label, kind] = known[code] || ['天气未知', 'unknown'];
+  const entry = known[code];
+  const [label, kind] = Array.isArray(entry) ? entry : ['天气未知', 'unknown'];
   return { label, kind };
 }
 function localTimeAt(date, minute, meta) {
@@ -381,6 +398,8 @@ function solarIcon(event, width, height) {
   return { type: 'image', src, width, height, resizeMode: 'contain' };
 }
 const MOON = "<path d='M51 2C38 3 36 18 46 24C51 27 58 25 61 21C50 23 44 10 51 2Z' fill='#F6F5ED'/>";
+const CLEAR_NIGHT_ICON = "<path d='M30 9C12 9 5 28 15 41C23 52 40 49 46 39C30 43 19 23 30 9Z' fill='#F3F7FC'/>"
+  + "<path d='M43 3l1.8 6.2L51 11l-6.2 1.8L43 19l-1.8-6.2L35 11l6.2-1.8ZM56 18l1.2 3.8L61 23l-3.8 1.2L56 28l-1.2-3.8L51 23l3.8-1.2Z' fill='#F3F7FC'/>";
 function snowMarks(code) {
   const points = code === 'LIGHT_SNOW' ? [[23,44],[41,47]] : code === 'HEAVY_SNOW' || code === 'STORM_SNOW'
     ? [[15,43],[27,49],[39,43],[51,49]] : [[20,44],[32,49],[45,44]];
@@ -392,8 +411,8 @@ export function iconSource(code, day, overview = false, cloud) {
   const { kind } = condition(code);
   let body = CLOUD;
   if (kind === 'clear') body = day
-    ? "<circle cx='32' cy='28' r='12' fill='#FFD879'/><path d='M32 5v5M32 46v5M9 28h5M50 28h5M16 12l4 4M44 40l4 4M48 12l-4 4M20 40l-4 4' stroke='#FFD879' stroke-width='3' stroke-linecap='round'/>"
-    : "<path d='M39 6C17 5 9 30 24 44C35 54 53 47 57 36C39 42 26 20 39 6Z' fill='#F6F5ED'/>";
+    ? "<circle cx='32' cy='28' r='12' fill='#FFD330'/><path d='M32 5v5M32 46v5M9 28h5M50 28h5M16 12l4 4M44 40l4 4M48 12l-4 4M20 40l-4 4' stroke='#FFD330' stroke-width='3' stroke-linecap='round'/>"
+    : CLEAR_NIGHT_ICON;
   if (kind === 'partly' && !overview) body = (day ? PARTLY_SUN : MOON) + CLOUD;
   if (kind === 'rain') {
     // Show a plain rain cloud when cloud cover is unknown or overcast.
@@ -440,8 +459,11 @@ export function themeFor(model) {
     const t = Math.max(0, Math.min(1, model.twilight.amount));
     const dawn = model.twilight.phase === 'dawn', from = dawn ? night : day, to = dawn ? day : night;
     if (['clear', 'partly'].includes(model.kind)) {
-      const middle = dawn ? ['#6B7DAB', '#AA9AB5', '#D5B7A8'] : ['#536C9A', '#9295B4', '#C1A59E'];
-      colors = t < .5 ? from.map((c,i)=>mix(c,middle[i],smooth(t*2))) : middle.map((c,i)=>mix(c,to[i],smooth((t-.5)*2)));
+      const middle = dawn ? ['#6B7DAB', '#AA9AB5', '#D5B7A8'] : ['#435879', '#7D7C97', '#B19A93'];
+      // Let warm dusk colors peak shortly before sunset while preserving continuous endpoints.
+      const peak = dawn ? .5 : .3;
+      colors = t < peak ? from.map((c,i)=>mix(c,middle[i],smooth(t/peak)))
+        : middle.map((c,i)=>mix(c,to[i],smooth((t-peak)/(1-peak))));
     } else colors = from.map((c,i)=>mix(c,to[i],smooth(t)));
   }
   return { type: 'linear', colors, stops: [0, 0.56, 1],
@@ -500,7 +522,7 @@ const UI = Object.freeze({
     hourLabel: 12, hourTemperature: 14, hourIconWidth: 26, hourIconHeight: 22 },
 });
 const lineHeight = size => Math.ceil(size * 1.2);
-function profileFor(family, stale) {
+function profileFor(family) {
   const key = family === 'systemSmall' ? 'small' : family === 'systemLarge' ? 'large' : 'medium';
   const p = { ...UI[key] };
   return p;
@@ -557,7 +579,7 @@ function hourlyTimeline(m, p) {
     centered(text(h.label, p.hourLabel, { font: { size: p.hourLabel, weight: 'medium' }, opacity: UI.secondary, textAlign: 'center' }), labelHeight),
     spacer(2),
     h.event ? solarIcon(h.event, p.hourIconWidth, p.hourIconHeight)
-      : h.missing ? centered(text('—', 13, { opacity: 0.5 }), p.hourIconHeight) : icon(h.code, h.day, p.hourIconWidth, p.hourIconHeight, false, h.cloud),
+      : h.missing || h.code === 'UNKNOWN' ? centered(text('—', 13, { opacity: 0.5 }), p.hourIconHeight) : icon(h.code, h.day, p.hourIconWidth, p.hourIconHeight, false, h.cloud),
     spacer(1),
     centered(text(h.event ? h.event === 'sunrise' ? '日出' : '日落' : temperatureText(h.temperature), h.event ? 11 : p.hourTemperature,
       { font: { size: h.event ? 11 : p.hourTemperature, weight: 'medium' }, textAlign: 'center' }), temperatureHeight),
@@ -585,7 +607,7 @@ function dailyRows(m) {
   days.forEach((d, i) => {
     children.push(row([
       dailyCell(text(d.label, 14, { font: { size: 14, weight: 'medium' } }), 1, 'start'),
-      dailyCell(d.missing ? text('—', 13, { opacity: 0.4 }) : icon(d.code, true, 26, 24), 1, 'center'),
+      dailyCell(d.missing || d.code === 'UNKNOWN' ? text('—', 13, { opacity: 0.4 }) : icon(d.code, true, 26, 24), 1, 'center'),
       dailyCell(text(temperatureText(d.low), 14, { font: { size: 14, weight: 'semibold' }, opacity: 0.38 }), 1.5, 'center'),
       row([spacer(8), rangeBar(d, days)], { flex: 2.4, height: 4 }),
       dailyCell(text(temperatureText(d.high), 14, { font: { size: 14, weight: 'semibold' }, textAlign: 'right' }), 0.7, 'end'),
@@ -622,7 +644,7 @@ function largeContent(m, p) {
     m.stale ? updateLabel(m.fetchedAt) : spacer(12)];
 }
 export function renderWidget(m, family, config, refreshAt) {
-  const p = profileFor(family, m.stale);
+  const p = profileFor(family);
   const render = family === 'systemSmall' ? smallContent : family === 'systemLarge' ? largeContent : mediumContent;
   return { type: 'widget', padding: p.padding, gap: 0, backgroundGradient: themeFor(m), backgroundImage: skyBackground(m, family),
     refreshAfter: new Date(Math.min(refreshAt, m.nextChangeAt ?? refreshAt)).toISOString(), children: render(m, p) };
