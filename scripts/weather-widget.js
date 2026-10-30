@@ -110,24 +110,24 @@ function failureState(region, old, now) {
 // ---------- Network: shared deadlines; never log URLs containing tickets ----------
 async function request(ctx, url, post, body, deadline, clock) {
   const remaining = deadline - clock();
-  if (remaining <= 0) throw new WeatherError('Weather request timed out');
+  if (remaining <= 0) throw new WeatherError('天气请求超时');
   const options = { headers: { ...HEADERS }, timeout: Math.min(7000, remaining) };
   if (post) options.body = body === undefined ? '' : JSON.stringify(body);
   if (body !== undefined) options.headers['Content-Type'] = 'application/json';
   let response;
   try { response = await ctx.http[post ? 'post' : 'get'](url, options); }
-  catch (_) { throw new WeatherError('Network unavailable'); }
-  if (clock() >= deadline) throw new WeatherError('Weather request timed out');
+  catch (_) { throw new WeatherError('网络连接失败'); }
+  if (clock() >= deadline) throw new WeatherError('天气请求超时');
   const status = Number(response.status);
-  if (status === 401 || status === 403) throw new WeatherError('Authentication failed', true);
-  if (!finite(status) || status < 200 || status >= 300) throw new WeatherError('Weather service unavailable');
+  if (status === 401 || status === 403) throw new WeatherError('临时认证失败', true);
+  if (!finite(status) || status < 200 || status >= 300) throw new WeatherError('天气服务暂不可用');
   let data;
-  try { data = await response.json(); } catch (_) { throw new WeatherError('Invalid weather response'); }
-  if (clock() >= deadline) throw new WeatherError('Weather request timed out');
-  if (!data || typeof data !== 'object') throw new WeatherError('Invalid weather data');
+  try { data = await response.json(); } catch (_) { throw new WeatherError('服务未返回有效数据'); }
+  if (clock() >= deadline) throw new WeatherError('天气请求超时');
+  if (!data || typeof data !== 'object') throw new WeatherError('天气数据格式异常');
   if ([401, 403].includes(Number(data.statusCode))
     || /invalid ticket|ticket expired|expired ticket|auth failed|unauthorized/i.test(String(data.message || data.error || ''))) {
-    throw new WeatherError('Authentication expired', true);
+    throw new WeatherError('临时认证已失效', true);
   }
   return data;
 }
@@ -137,13 +137,13 @@ async function coordinates(ctx, config, cached, deadline, clock) {
   const p = data.items?.[0];
   const geo = { version: 1, region: config.region, name: short(p?.name, 80) || short(config.region, 80),
     lon: numeric(p?.longitude), lat: numeric(p?.latitude), at: clock() };
-  if (!validGeo(geo)) throw new WeatherError('Region not found. Use a full city/district name.');
+  if (!validGeo(geo)) throw new WeatherError('未找到地区，请填写完整市区名');
   write(ctx, 'geo', geo);
   return geo;
 }
 async function ticket(ctx, deadline, clock) {
   const data = await request(ctx, `${H5}/api/ticket`, true, undefined, deadline, clock);
-  if (typeof data.ticket !== 'string' || !data.ticket.trim()) throw new WeatherError('Authentication unavailable');
+  if (typeof data.ticket !== 'string' || !data.ticket.trim()) throw new WeatherError('未获得临时认证');
   return data.ticket;
 }
 async function fetchWeather(ctx, geo, deadline, clock) {
@@ -202,7 +202,7 @@ function todayTemperatures(s, date) {
 export function normalizeWeather(data, region, now) {
   const r = data?.result, current = r?.realtime;
   if (data?.status !== 'ok' || current?.status !== 'ok' || numeric(current.temperature) === null) {
-    throw new WeatherError('Current weather unavailable');
+    throw new WeatherError('当前天气暂不可用');
   }
   const shift = numeric(data.tzshift);
   const snapshot = { version: SNAPSHOT_VERSION, region, fetchedAt: now, sourceAt: numeric(data.server_time),
@@ -270,14 +270,14 @@ function daytime(at, snapshot, code) {
 }
 export function condition(code) {
   const known = {
-    CLEAR_DAY: ['Clear', 'clear'], CLEAR_NIGHT: ['Clear', 'clear'], PARTLY_CLOUDY_DAY: ['Partly cloudy', 'partly'], PARTLY_CLOUDY_NIGHT: ['Partly cloudy', 'partly'], CLOUDY: ['Overcast', 'cloud'],
-    LIGHT_RAIN: ['Light rain', 'rain'], MODERATE_RAIN: ['Moderate rain', 'rain'], HEAVY_RAIN: ['Heavy rain', 'rain'], STORM_RAIN: ['Heavy downpour', 'rain'], RAIN: ['Rain', 'rain'],
-    LIGHT_SNOW: ['Light snow', 'snow'], MODERATE_SNOW: ['Moderate snow', 'snow'], HEAVY_SNOW: ['Heavy snow', 'snow'], STORM_SNOW: ['Blizzard', 'snow'], SNOW: ['Snow', 'snow'],
-    SLEET: ['Sleet', 'mixed'], RAIN_SNOW: ['Sleet', 'mixed'], HAIL: ['Hail', 'hail'], FREEZING_RAIN: ['Freezing rain', 'ice'], FREEZING_DRIZZLE: ['Freezing drizzle', 'ice'],
-    LIGHT_HAZE: ['Light haze', 'haze'], MODERATE_HAZE: ['Moderate haze', 'haze'], HEAVY_HAZE: ['Heavy haze', 'haze'],
-    FOG: ['Fog', 'fog'], DUST: ['Dust', 'haze'], SAND: ['Blowing dust', 'haze'], WIND: ['Windy', 'wind'], THUNDER_SHOWER: ['Thunderstorms', 'storm'],
+    CLEAR_DAY: ['晴', 'clear'], CLEAR_NIGHT: ['晴', 'clear'], PARTLY_CLOUDY_DAY: ['多云', 'partly'], PARTLY_CLOUDY_NIGHT: ['多云', 'partly'], CLOUDY: ['阴', 'cloud'],
+    LIGHT_RAIN: ['小雨', 'rain'], MODERATE_RAIN: ['中雨', 'rain'], HEAVY_RAIN: ['大雨', 'rain'], STORM_RAIN: ['暴雨', 'rain'], RAIN: ['雨', 'rain'],
+    LIGHT_SNOW: ['小雪', 'snow'], MODERATE_SNOW: ['中雪', 'snow'], HEAVY_SNOW: ['大雪', 'snow'], STORM_SNOW: ['暴雪', 'snow'], SNOW: ['雪', 'snow'],
+    SLEET: ['雨夹雪', 'mixed'], RAIN_SNOW: ['雨夹雪', 'mixed'], HAIL: ['冰雹', 'hail'], FREEZING_RAIN: ['冻雨', 'ice'], FREEZING_DRIZZLE: ['冻毛毛雨', 'ice'],
+    LIGHT_HAZE: ['轻度雾霾', 'haze'], MODERATE_HAZE: ['中度雾霾', 'haze'], HEAVY_HAZE: ['重度雾霾', 'haze'],
+    FOG: ['雾', 'fog'], DUST: ['浮尘', 'haze'], SAND: ['沙尘', 'haze'], WIND: ['大风', 'wind'], THUNDER_SHOWER: ['雷阵雨', 'storm'],
   };
-  const [label, kind] = known[code] || ['Unknown', 'unknown'];
+  const [label, kind] = known[code] || ['天气未知', 'unknown'];
   return { label, kind };
 }
 function localTimeAt(date, minute, meta) {
@@ -328,11 +328,11 @@ export function viewModel(s, config, geo, now, stale = false) {
   for (let i = 1; i <= 6; i++) {
     const at = floor + i * HOUR, h = byHour.get(at);
     hours.push({ at, temperature: h?.temperature ?? null, code: h?.code || 'UNKNOWN', cloud: h?.cloud,
-      label: `${localParts(at, s).hour}:00`, day: daytime(at, s, h?.code || ''), missing: !h });
+      label: `${localParts(at, s).hour}时`, day: daytime(at, s, h?.code || ''), missing: !h });
   }
   const futureDays = Array.from({ length: FORECAST_DAYS }, (_, i) => {
     const date = nextDate(today, i + 1), d = s.days.find(d => d.date === date);
-    const label = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][new Date(`${date}T12:00:00Z`).getUTCDay()];
+    const label = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(`${date}T12:00:00Z`).getUTCDay()];
     return { date, label, low: d?.low ?? null, high: d?.high ?? null, code: d?.code || 'UNKNOWN', missing: !d };
   });
   const timeline = solarTimeline(s, now, hours);
@@ -518,15 +518,15 @@ function separator() {
   return row([spacer()], { height: 0.5, backgroundColor: '#FFFFFF26' });
 }
 function updateLabel(at) {
-  return row([text('Updated', 9, { opacity: 0.8 }), { type: 'date', date: new Date(at).toISOString(), format: 'relative',
+  return row([text('上次更新', 9, { opacity: 0.8 }), { type: 'date', date: new Date(at).toISOString(), format: 'relative',
     font: { size: 9 }, textColor: '#FFFFFFCC', textAlign: 'left', maxLines: 1, minScale: 0.5 }, spacer()], { gap: 3, height: 12 });
 }
 function todayRange(m, p, align = 'end') {
-  const label = value => column([text(value, p.rangeLabel)],
-    { width: p.rangeLabel * 1.3, alignItems: 'start' });
+  const label = last => column([text('最', p.rangeLabel), text(last, p.rangeLabel)],
+    { width: p.rangeLabel, alignItems: 'center' });
   const value = n => text(temperatureText(n), p.rangeTemperature,
     { font: { size: p.rangeTemperature, weight: 'light' }, textAlign: 'right' });
-  const values = [label('H:'), value(m.today.high), spacer(5), label('L:'), value(m.today.low)];
+  const values = [label('高'), value(m.today.high), spacer(5), label('低'), value(m.today.low)];
   // Align small widgets left and larger widgets right; scale long values to fit.
   return row(align === 'start' ? [...values, spacer()] : [spacer(), ...values],
     { ...(align === 'end' ? { width: p.rightWidth } : {}), height: lineHeight(p.rangeTemperature), gap: 1 });
@@ -540,7 +540,7 @@ function currentHeader(m, p) {
     4 + p.mainIconHeight + 2 + lineHeight(p.condition) + (range ? lineHeight(p.rangeTemperature) + p.rangeBottom : 0));
   const symbol = trailing(icon(m.code, m.isDay, p.mainIconWidth, p.mainIconHeight, true, m.cloud), p.mainIconHeight + 2);
   const description = m.stale && p.inlineStatus
-    ? row([text('Updated', 7, { opacity: .8 }),
+    ? row([text('上次更新', 7, { opacity: .8 }),
       { type: 'date', date: new Date(m.fetchedAt).toISOString(), format: 'relative', font: { size: 7 }, textColor: '#FFFFFFCC', maxLines: 1, minScale: .5 },
       spacer(), text(m.label, p.condition, { textAlign: 'right', minScale: .4 })], { height: lineHeight(p.condition), gap: 2 })
     : trailing(text(m.label, p.condition, { textAlign: 'right' }), lineHeight(p.condition));
@@ -559,7 +559,7 @@ function hourlyTimeline(m, p) {
     h.event ? solarIcon(h.event, p.hourIconWidth, p.hourIconHeight)
       : h.missing ? centered(text('—', 13, { opacity: 0.5 }), p.hourIconHeight) : icon(h.code, h.day, p.hourIconWidth, p.hourIconHeight, false, h.cloud),
     spacer(1),
-    centered(text(h.event ? h.event === 'sunrise' ? 'Sunrise' : 'Sunset' : temperatureText(h.temperature), h.event ? 11 : p.hourTemperature,
+    centered(text(h.event ? h.event === 'sunrise' ? '日出' : '日落' : temperatureText(h.temperature), h.event ? 11 : p.hourTemperature,
       { font: { size: h.event ? 11 : p.hourTemperature, weight: 'medium' }, textAlign: 'center' }), temperatureHeight),
   ], { width: 28, alignItems: 'center' }));
   return row(columns.flatMap((c, i) => i ? [spacer(), c] : [c]), { height });
@@ -600,7 +600,7 @@ function smallContent(m, p) {
     leading(text(m.title, p.title, { font: { size: p.title, weight: 'medium' } }), lineHeight(p.title)),
     leading(text(temperatureText(m.temperature), p.temperature, { font: { size: p.temperature, weight: 'light' } }), lineHeight(p.temperature)),
     leading(icon(m.code, m.isDay, 18, 14, true, m.cloud), 14),
-    m.stale ? row([text(m.label, p.condition), spacer(), text('Updated', 7, { opacity: .8 }),
+    m.stale ? row([text(m.label, p.condition), spacer(), text('上次更新', 7, { opacity: .8 }),
       { type: 'date', date: new Date(m.fetchedAt).toISOString(), format: 'relative', font: { size: 7 }, textColor: '#FFFFFFCC', maxLines: 1, minScale: .5 }],
       { height: lineHeight(p.condition), gap: 2 }) : leading(text(m.label, p.condition), lineHeight(p.condition)),
     spacer(),
@@ -630,15 +630,15 @@ export function renderWidget(m, family, config, refreshAt) {
 function messageWidget(config, family, message, refreshAt) {
   return { type: 'widget', padding: 12, backgroundGradient: themeFor({ isDay: false }),
     refreshAfter: new Date(refreshAt).toISOString(),
-    children: [text(config.title || config.region || 'Set weather region', 14), spacer(),
+    children: [text(config.title || config.region || '配置天气地区', 14), spacer(),
       text('—', 34), text(message, 11, { maxLines: family === 'systemSmall' ? 2 : 3, opacity: 0.85 }), spacer()] };
 }
 
 // The injected clock is for tests; Egern uses the default export with Date.now.
 export async function runWidget(ctx, clock = Date.now) {
   const config = settings(ctx.env), family = ctx.widgetFamily || 'systemSmall', now = clock();
-  if (!['systemSmall', 'systemMedium', 'systemLarge'].includes(family)) return messageWidget(config, family, 'Choose a small, medium or large Home Screen widget', now + 30 * MINUTE);
-  if (!config.region || Array.from(config.region).length > 120) return messageWidget(config, family, 'Set REGION to a full city/district name', now + 30 * MINUTE);
+  if (!['systemSmall', 'systemMedium', 'systemLarge'].includes(family)) return messageWidget(config, family, '请选择主屏幕小、中或大尺寸', now + 30 * MINUTE);
+  if (!config.region || Array.from(config.region).length > 120) return messageWidget(config, family, '请在 REGION 填写完整市区名', now + 30 * MINUTE);
   let geo = read(ctx, 'geo', config.region), snapshot = read(ctx, 'weather', config.region);
   if (!validGeo(geo) || geo.at > now) { remove(ctx, 'geo'); geo = null; }
   if (!validSnapshot(snapshot, now)) { remove(ctx, 'weather'); snapshot = null; }
@@ -654,7 +654,7 @@ export async function runWidget(ctx, clock = Date.now) {
   }
   if (snapshot?.retryAt > now) {
     return snapshot.current ? renderWidget(viewModel(snapshot, config, geo, now, true), family, config, snapshot.retryAt)
-      : messageWidget(config, family, 'Weather unavailable. Try again later.', snapshot.retryAt);
+      : messageWidget(config, family, '天气暂不可用，稍后重试', snapshot.retryAt);
   }
   try {
     const deadline = now + 25000;
@@ -668,7 +668,7 @@ export async function runWidget(ctx, clock = Date.now) {
     snapshot = failureState(config.region, snapshot, failedAt);
     write(ctx, 'weather', snapshot);
     return snapshot.current ? renderWidget(viewModel(snapshot, config, geo, failedAt, true), family, config, snapshot.retryAt)
-      : messageWidget(config, family, error instanceof WeatherError ? error.message : 'Weather unavailable', snapshot.retryAt);
+      : messageWidget(config, family, error instanceof WeatherError ? error.message : '天气暂不可用', snapshot.retryAt);
   }
 }
 export default async function(ctx) { return runWidget(ctx); }
