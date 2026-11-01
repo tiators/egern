@@ -5,7 +5,6 @@ env_schema:
   REGION:
     name: Weather region
     description: Enter the full city and district name.
-    default_value: Xihu District, Hangzhou
   TITLE:
     name: Display name
     description: Optional. Leave blank to use the name returned by geocoding.
