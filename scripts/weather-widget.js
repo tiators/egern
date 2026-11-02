@@ -11,6 +11,8 @@ const HEADERS = {
 const MINUTE = 60000, HOUR = 60 * MINUTE, DAY = 24 * HOUR;
 const STALE_LIMIT = 6 * HOUR;
 const SNAPSHOT_VERSION = 4, FORECAST_DAYS = 5;
+// Local presentation policy, not Apple's private switching algorithm.
+const EVENING_HOUR = 20, TEMPERATURE_CHANGE = 4;
 // Keep storage keys stable and version their contents to avoid orphaned records.
 export const CACHE_KEYS = Object.freeze({ geo: 'egern.weather.geo.v1', weather: 'egern.weather.snapshot.v1' });
 const LIMITS = { geo: 768, weather: 3328 }; // UTF-8 byte limits, including key names.
@@ -102,8 +104,9 @@ function validSnapshot(s, now) {
     && Array.isArray(s.days) && s.days.length <= FORECAST_DAYS
     && s.days.every(d => onlyKeys(d, ['date', 'low', 'high', 'code']) && isDate(d.date) && nullable(d.low) && nullable(d.high)
       && (d.low === null || d.high === null || d.low <= d.high) && isCode(d.code)) && uniqueBy(s.days, 'date')
-    && (s.today === undefined || s.today === null || onlyKeys(s.today, ['date', 'low', 'high']) && isDate(s.today.date)
+    && (s.today === undefined || s.today === null || onlyKeys(s.today, ['date', 'low', 'high', 'code']) && isDate(s.today.date)
       && nullable(s.today.low) && nullable(s.today.high) && (finite(s.today.low) || finite(s.today.high))
+      && (s.today.code === undefined || isCode(s.today.code))
       && (s.today.low === null || s.today.high === null || s.today.low <= s.today.high))
     && Array.isArray(s.astro) && s.astro.length <= 2
     && s.astro.every(a => onlyKeys(a, ['date', 'rise', 'set']) && isDate(a.date) && validMinute(a.rise) && validMinute(a.set))
@@ -234,9 +237,12 @@ function dailyTemperatures(value) {
   if (low !== null && high !== null && low > high) low = high = null;
   return { low, high };
 }
-function todayTemperatures(s, date) {
+function todayForecast(s, date) {
   // Reuse today from legacy snapshots; the entry point refreshes incomplete records.
-  const d = s.today?.date === date ? s.today : s.days.find(d => d.date === date);
+  return s.today?.date === date ? s.today : s.days.find(d => d.date === date);
+}
+function todayTemperatures(s, date) {
+  const d = todayForecast(s, date);
   return finite(d?.low) || finite(d?.high) ? { date, low: d.low ?? null, high: d.high ?? null } : null;
 }
 export function normalizeWeather(data, region, now) {
@@ -266,7 +272,7 @@ export function normalizeWeather(data, region, now) {
   }
   const dt = rows(daily.temperature, 'date', false), ds = rows(daily.skycon, 'date', false), da = rows(daily.astro, 'date', false);
   const range = dailyTemperatures(dt.get(today));
-  if (range.low !== null || range.high !== null) snapshot.today = { date: today, ...range };
+  if (range.low !== null || range.high !== null) snapshot.today = { date: today, ...range, code: codeOf(ds.get(today)?.value) };
   for (let i = 1; i <= FORECAST_DAYS; i++) {
     const date = nextDate(today, i);
     if (dt.has(date) || ds.has(date)) {
@@ -293,16 +299,22 @@ export function normalizeWeather(data, region, now) {
 }
 function prune(s, now) {
   const date = localParts(now, s).date, range = todayTemperatures(s, date);
+  const code = todayForecast(s, date)?.code;
   const { today, notice, ...rest } = s;
-  return { ...rest, ...(notice?.until > now ? { notice } : {}), today: range, hours: s.hours.filter(h => h.at > now),
+  return { ...rest, ...(notice?.until > now ? { notice } : {}), today: range && { ...range, ...(code ? { code } : {}) }, hours: s.hours.filter(h => h.at > now),
     days: s.days.filter(d => d.date > date), astro: s.astro.filter(a => a.date >= date) };
 }
+const FALLBACK_DAY = { rise: 6 * 60, set: 18 * 60 };
+function daylightRange(snapshot, date, code) {
+  const a = snapshot.astro.find(a => a.date === date);
+  if (finite(a?.rise) && finite(a?.set) && a.rise < a.set) return a;
+  return /_(DAY|NIGHT)$/.test(code) ? null : FALLBACK_DAY;
+}
 function daytime(at, snapshot, code) {
-  const p = localParts(at, snapshot), a = snapshot.astro.find(a => a.date === p.date);
-  if (finite(a?.rise) && finite(a?.set) && a.rise < a.set) return p.hour * 60 + p.minute >= a.rise && p.hour * 60 + p.minute < a.set;
-  if (code.endsWith('_NIGHT')) return false;
-  if (code.endsWith('_DAY')) return true;
-  return p.hour >= 6 && p.hour < 18;
+  const p = localParts(at, snapshot), range = daylightRange(snapshot, p.date, code);
+  if (!range) return code.endsWith('_DAY');
+  const minute = p.hour * 60 + p.minute;
+  return minute >= range.rise && minute < range.set;
 }
 const CONDITIONS = Object.freeze({
   CLEAR_DAY: ['晴', 'clear'], CLEAR_NIGHT: ['晴', 'clear'], PARTLY_CLOUDY_DAY: ['多云', 'partly'], PARTLY_CLOUDY_NIGHT: ['多云', 'partly'], CLOUDY: ['阴', 'cloud'],
@@ -356,6 +368,25 @@ function solarTimeline(s, events, now, hours) {
   const eventTimes = new Set(upcoming.map(e => e.at));
   return [...hours.filter(h => !eventTimes.has(h.at)), ...upcoming].sort((a, b) => a.at - b.at).slice(0, 6);
 }
+const weekday = date => ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(`${date}T12:00:00Z`).getUTCDay()];
+const PRECIPITATION_LABELS = { rain: '有雨', storm: '有雷雨', snow: '有雪', mixed: '有雨夹雪', ice: '有冻雨', hail: '有冰雹' };
+function precipitationType(code) {
+  return PRECIPITATION_LABELS[condition(code).kind] || '';
+}
+function eveningOverview(s, now, hours, futureDays, stale) {
+  const local = localParts(now, s), today = todayForecast(s, local.date), tomorrow = futureDays[0];
+  // After midnight, return to the hourly layout. Missing or stale data cannot trigger a summary.
+  const complete = d => finite(d?.low) && finite(d?.high) && condition(d?.code).kind !== 'unknown';
+  if (stale || local.hour < EVENING_HOUR || !complete(today) || !futureDays.slice(0, 4).every(complete)) return null;
+  // Keep current and imminent precipitation in the hourly view, ahead of tomorrow's outlook.
+  if (condition(s.current.code).kind === 'unknown' || precipitationType(s.current.code)
+    || hours.slice(0, 2).some(h => h.missing || condition(h.code).kind === 'unknown' || precipitationType(h.code))) return null;
+  const delta = tomorrow.high - today.high, wet = precipitationType(tomorrow.code);
+  const change = delta <= -TEMPERATURE_CHANGE ? '气温降低' : delta >= TEMPERATURE_CHANGE ? '气温升高' : '';
+  if (!change && (!wet || wet === precipitationType(today.code))) return null;
+  return { text: `明天${change}${change && wet ? '且' : ''}${wet}`, wet: Boolean(wet),
+    days: [{ ...today, label: weekday(local.date) }, ...futureDays.slice(0, 4)] };
+}
 export function viewModel(s, config, geo, now, stale = false) {
   const today = localParts(now, s).date;
   const byHour = new Map(s.hours.map(h => [h.at, h]));
@@ -366,18 +397,26 @@ export function viewModel(s, config, geo, now, stale = false) {
   });
   const futureDays = Array.from({ length: FORECAST_DAYS }, (_, i) => {
     const date = nextDate(today, i + 1), d = s.days.find(d => d.date === date);
-    const label = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(`${date}T12:00:00Z`).getUTCDay()];
+    const label = weekday(date);
     return { date, label, low: d?.low ?? null, high: d?.high ?? null, code: d?.code || 'UNKNOWN', missing: !d };
   });
   // Resolve astronomy once for the timeline, sky colors and refresh boundaries.
   const events = solarEvents(s), timeline = solarTimeline(s, events, now, hours);
   const twilight = twilightAt(events, today, now), notice = !stale && s.notice?.until > now ? s.notice : null;
   const boundaries = events.flatMap(e => [e.start, e.at, e.end]).filter(at => at > now);
+  // Schedule the same fallback boundaries used by daytime, without inventing solar events.
+  if (daylightRange(s, today, s.current.code) === FALLBACK_DAY) {
+    for (const minute of [FALLBACK_DAY.rise, FALLBACK_DAY.set]) {
+      const at = localTimeAt(today, minute, s);
+      if (at !== null && at > now) boundaries.push(at);
+    }
+  }
   const midnight = localTimeAt(nextDate(today, 1), 0, s);
   const nextChangeAt = Math.min(midnight ?? hours[0].at, ...boundaries,
     twilight ? (Math.floor(now / (15 * MINUTE)) + 1) * 15 * MINUTE : Infinity);
   return { title: config.title || geo?.name || config.region, ...s.current, ...condition(s.current.code),
     today: todayTemperatures(s, today), hours: timeline, futureDays, nextChangeAt, nextHourAt: hours[0].at, notice,
+    overview: eveningOverview(s, now, hours, futureDays, stale),
     isDay: daytime(now, s, s.current.code), twilight, stale, fetchedAt: s.fetchedAt };
 }
 
@@ -649,6 +688,24 @@ function smallContent(m, p) {
 function mediumContent(m, p) {
   return [spacer(), currentHeader(m, p), spacer(2), hourlyTimeline(m, p), spacer()];
 }
+function overviewContent(m, p) {
+  // Explicit shared height keeps both columns aligned on standard and compact iPhones.
+  const height = 126;
+  const left = column([
+    leading(text(m.title, p.title, { weight: 'medium' }), lineHeight(p.title)),
+    leading(text(temperatureText(m.temperature), p.temperature, { weight: 'light' }), lineHeight(p.temperature)),
+    spacer(), leading({ ...image(`sf-symbol:${m.overview.wet ? 'umbrella.fill' : 'thermometer'}`, 18, 18), color: UI.white }, 18), spacer(3),
+    leading(text(m.overview.text, 12, { weight: 'medium', minScale: .65 }), 15),
+  ], { flex: 1, height });
+  const rows = m.overview.days.map(d => row([
+    text(d.label, 13, { weight: 'medium' }), spacer(7),
+    d.missing || d.code === 'UNKNOWN' ? { ...centered(text('—', 13, { opacity: .4 }), 20), width: 22 } : icon(d.code, true, 22, 20),
+    column([trailing(text(temperatureText(d.low), 14, { weight: 'medium', opacity: .45 }), 20)], { flex: 1 }),
+    column([trailing(text(temperatureText(d.high).replace('°', ''), 14, { weight: 'medium' }), 20)], { width: 28 }),
+  ], { height: 20 }));
+  const right = column(rows.flatMap((r, i) => i ? [spacer(), r] : [r]), { flex: 1.15, height });
+  return [spacer(), row([left, spacer(12), right], { height, alignItems: 'start' }), spacer()];
+}
 function largeContent(m, p) {
   // Flexible spacing fits the forecast rows on both standard and compact widgets.
   return [currentHeader(m, p), separator(),
@@ -660,9 +717,11 @@ function largeContent(m, p) {
 }
 export function renderWidget(m, family, refreshAt) {
   const small = family === 'systemSmall', large = family === 'systemLarge';
+  const medium = !small && !large, overview = medium && m.overview && !m.stale && !m.notice;
   const p = small ? UI.small : large ? UI.large : UI.medium;
-  const render = small ? smallContent : large ? largeContent : mediumContent;
-  const noticeRefresh = large ? m.notice?.until ?? Infinity : Infinity;
+  const render = small ? smallContent : large ? largeContent : overview ? overviewContent : mediumContent;
+  const noticeRefresh = large || medium && m.overview ? m.notice?.until ?? Infinity : Infinity;
+  // The hourly grid also determines when imminent rain replaces the evening overview.
   const hourlyRefresh = small ? Infinity : m.nextHourAt ?? Infinity;
   const gradient = themeFor(m);
   return { type: 'widget', padding: p.padding, gap: 0, backgroundGradient: gradient, backgroundImage: skyBackground(gradient, family),
