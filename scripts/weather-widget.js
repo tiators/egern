@@ -65,7 +65,8 @@ function read(ctx, kind, region) {
     if (typeof raw !== 'string' || utf8Bytes(raw) + utf8Bytes(CACHE_KEYS[kind]) > LIMITS[kind]) throw Error();
     const value = JSON.parse(raw);
     if (value === null) return null;
-    if (!(kind === 'weather' ? [1, 2, 3, SNAPSHOT_VERSION].includes(value.version) : value.version === 1) || value.region !== region) throw Error();
+    const versions = kind === 'weather' ? [1, 2, 3, SNAPSHOT_VERSION] : [1];
+    if (!versions.includes(value.version) || value.region !== region) throw Error();
     return value;
   } catch (_) { remove(ctx, kind); return null; }
 }
@@ -91,7 +92,7 @@ function validSnapshot(s, now) {
   const validCloud = h => h.cloud === undefined || needsCloud(h.code) && finite(h.cloud) && h.cloud >= 0 && h.cloud <= 1;
   return finite(s.fetchedAt) && s.fetchedAt <= now && nullable(s.sourceAt)
     && typeof s.timezone === 'string' && finite(s.shift) && Math.abs(s.shift) <= 86400
-    && onlyKeys(s.current, ['temperature', 'code', 'cloud']) && finite(s.current?.temperature) && isCode(s.current.code) && validCloud(s.current)
+    && onlyKeys(s.current, ['temperature', 'code', 'cloud']) && finite(s.current.temperature) && isCode(s.current.code) && validCloud(s.current)
     && Array.isArray(s.hours) && s.hours.length <= 7
     && s.hours.every(h => onlyKeys(h, ['at', 'temperature', 'code', 'cloud']) && finite(h.at) && Math.abs(h.at) <= 8.64e15
       && nullable(h.temperature) && isCode(h.code) && validCloud(h)) && uniqueBy(s.hours, 'at')
@@ -140,13 +141,19 @@ async function request(ctx, url, post, body, deadline, clock) {
 }
 async function coordinates(ctx, config, cached, deadline, clock) {
   if (validGeo(cached) && ageWithin(cached.at, 30 * DAY, clock())) return cached;
-  const data = await request(ctx, `${GEO_URL}?query=${encodeURIComponent(config.region)}&limit=1&lang=zh_CN`, false, undefined, deadline, clock);
-  const p = data.items?.[0];
-  const geo = { version: 1, region: config.region, name: short(p?.name, 80) || short(config.region, 80),
-    lon: numeric(p?.longitude), lat: numeric(p?.latitude), at: clock() };
-  if (!validGeo(geo)) throw new WeatherError('未找到地区，请填写完整市区名');
-  write(ctx, 'geo', geo);
-  return geo;
+  try {
+    const data = await request(ctx, `${GEO_URL}?query=${encodeURIComponent(config.region)}&limit=1&lang=zh_CN`, false, undefined, deadline, clock);
+    const p = data.items?.[0];
+    const geo = { version: 1, region: config.region, name: short(p?.name, 80) || short(config.region, 80),
+      lon: numeric(p?.longitude), lat: numeric(p?.latitude), at: clock() };
+    if (!validGeo(geo)) throw new WeatherError('未找到地区，请填写完整市区名');
+    write(ctx, 'geo', geo);
+    return geo;
+  } catch (error) {
+    // Coordinates for one region never move, so keep showing weather when geocoding is unavailable.
+    if (validGeo(cached)) return cached;
+    throw error;
+  }
 }
 async function ticket(ctx, deadline, clock) {
   const data = await request(ctx, `${H5}/api/ticket`, true, undefined, deadline, clock);
@@ -154,14 +161,14 @@ async function ticket(ctx, deadline, clock) {
   return data.ticket;
 }
 async function fetchWeather(ctx, geo, deadline, clock) {
-  let token = await ticket(ctx, deadline, clock);
+  const token = await ticket(ctx, deadline, clock);
   const upstream = `https://api.caiyunapp.com/v2.5/<t2.5>/${geo.lon},${geo.lat}/weather?dailysteps=16&hourlysteps=120&alert=true&begin=${Math.floor(clock() / 1000) - 86400}`;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try { return await request(ctx, `${H5}/api/?ticket=${encodeURIComponent(token)}`, true, { url: upstream }, deadline, clock); }
-    catch (error) {
-      if (!error.auth || attempt === 1 || deadline - clock() <= 0) throw error;
-      token = await ticket(ctx, deadline, clock);
-    }
+  const query = t => request(ctx, `${H5}/api/?ticket=${encodeURIComponent(t)}`, true, { url: upstream }, deadline, clock);
+  try { return await query(token); }
+  catch (error) {
+    // Retry once with a fresh ticket when the first one was rejected.
+    if (!error.auth || deadline - clock() <= 0) throw error;
+    return query(await ticket(ctx, deadline, clock));
   }
 }
 
@@ -233,14 +240,12 @@ function todayTemperatures(s, date) {
   return finite(d?.low) || finite(d?.high) ? { date, low: d.low ?? null, high: d.high ?? null } : null;
 }
 export function normalizeWeather(data, region, now) {
-  const r = data?.result, current = r?.realtime;
-  if (data?.status !== 'ok' || current?.status !== 'ok' || numeric(current.temperature) === null) {
-    throw new WeatherError('当前天气暂不可用');
-  }
+  const r = data?.result, current = r?.realtime, temperature = numeric(current?.temperature);
+  if (data?.status !== 'ok' || current?.status !== 'ok' || temperature === null) throw new WeatherError('当前天气暂不可用');
   const shift = numeric(data.tzshift);
   const snapshot = { version: SNAPSHOT_VERSION, region, fetchedAt: now, sourceAt: numeric(data.server_time),
     timezone: short(data.timezone, 64), shift: shift !== null && Math.abs(shift) <= 86400 ? shift : 28800,
-    current: { temperature: numeric(current.temperature), code: codeOf(current.skycon) },
+    current: { temperature, code: codeOf(current.skycon) },
     // Null means the range was requested but unavailable; an absent field marks legacy data.
     hours: [], days: [], today: null, astro: [], failures: 0, retryAt: 0 };
   const today = localParts(now, snapshot).date;
@@ -401,14 +406,13 @@ function rainStrokes(code) {
   const [path, width] = RAIN_STYLES[code] || ['M21 41l-3 7M33 41l-3 7M45 41l-3 7', 3];
   return `<path d='${path}' fill='none' stroke='#42CAE6' stroke-width='${width}' stroke-linecap='round'/>`;
 }
-function solarIcon(event, width, height) {
+function solarIcon(event) {
   const arrow = event === 'sunrise' ? 'M32 17V3m-6 6 6-6 6 6' : 'M32 3v14m-6-6 6 6 6-6';
-  const src = svgData(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 56'>
+  return svgData(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 56'>
 <path d='${arrow}' fill='none' stroke='#FFFFFF' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/>
 <path d='M18 44a14 14 0 0 1 28 0Z' fill='#FFD330'/>
 <path d='M32 22v3M12 30l3 3M49 33l3-3M6 44h5M53 44h5' fill='none' stroke='#FFD330' stroke-width='3' stroke-linecap='round'/>
 <path d='M5 49h54' fill='none' stroke='#FFFFFF' stroke-width='3' stroke-linecap='round'/></svg>`);
-  return { type: 'image', src, width, height, resizeMode: 'contain' };
 }
 const MOON = "<path d='M51 2C38 3 36 18 46 24C51 27 58 25 61 21C50 23 44 10 51 2Z' fill='#F6F5ED'/>";
 const CLEAR_NIGHT_ICON = "<path d='M30 9C12 9 5 28 15 41C23 52 40 49 46 39C30 43 19 23 30 9Z' fill='#F3F7FC'/>"
@@ -539,7 +543,8 @@ const text = (value, size = 12, { weight = 'regular', ...extra } = {}) => ({ typ
 const row = (children, extra = {}) => ({ type: 'stack', direction: 'row', alignItems: 'center', children, ...extra });
 const column = (children, extra = {}) => ({ type: 'stack', direction: 'column', alignItems: 'start', children, ...extra });
 const spacer = length => length === undefined ? { type: 'spacer' } : { type: 'spacer', length };
-const icon = (code, day, width, height = width, overview = false, cloud) => ({ type: 'image', ...iconSource(code, day, overview, cloud), width, height, resizeMode: 'contain' });
+const image = (src, width, height) => ({ type: 'image', src, width, height, resizeMode: 'contain' });
+const icon = (code, day, width, height = width, overview = false, cloud) => image(iconSource(code, day, overview, cloud).src, width, height);
 const leading = (node, height) => row([node, spacer()], { height });
 const trailing = (node, height) => row([spacer(), node], { height });
 const centered = (node, height) => row([spacer(), node, spacer()], { height });
@@ -584,15 +589,17 @@ function hourlyTimeline(m, p) {
   const labelHeight = lineHeight(p.hourLabel), temperatureHeight = lineHeight(p.hourTemperature);
   const height = labelHeight + 2 + p.hourIconHeight + 1 + temperatureHeight;
   const slots = Array.from({ length: 6 }, (_, i) => m.hours[i] || { label: '—', missing: true, temperature: null });
-  const columns = slots.map(h => column([
-    centered(text(h.label, p.hourLabel, { weight: 'medium', opacity: UI.secondary, textAlign: 'center' }), labelHeight),
-    spacer(2),
-    h.event ? solarIcon(h.event, p.hourIconWidth, p.hourIconHeight)
-      : h.missing || h.code === 'UNKNOWN' ? centered(text('—', 13, { opacity: 0.5 }), p.hourIconHeight) : icon(h.code, h.day, p.hourIconWidth, p.hourIconHeight, false, h.cloud),
-    spacer(1),
-    centered(text(h.event ? h.event === 'sunrise' ? '日出' : '日落' : temperatureText(h.temperature), h.event ? 11 : p.hourTemperature,
-      { weight: 'medium', textAlign: 'center' }), temperatureHeight),
-  ], { width: 28, alignItems: 'center' }));
+  const columns = slots.map(h => {
+    const glyph = h.event ? image(solarIcon(h.event), p.hourIconWidth, p.hourIconHeight)
+      : h.missing || h.code === 'UNKNOWN' ? centered(text('—', 13, { opacity: 0.5 }), p.hourIconHeight)
+      : icon(h.code, h.day, p.hourIconWidth, p.hourIconHeight, false, h.cloud);
+    const [value, size] = h.event ? [h.event === 'sunrise' ? '日出' : '日落', 11] : [temperatureText(h.temperature), p.hourTemperature];
+    return column([
+      centered(text(h.label, p.hourLabel, { weight: 'medium', opacity: UI.secondary, textAlign: 'center' }), labelHeight),
+      spacer(2), glyph, spacer(1),
+      centered(text(value, size, { weight: 'medium', textAlign: 'center' }), temperatureHeight),
+    ], { width: 28, alignItems: 'center' });
+  });
   return row(columns.flatMap((c, i) => i ? [spacer(), c] : [c]), { height });
 }
 function dailyCell(node, flex, align) {
