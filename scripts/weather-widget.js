@@ -325,33 +325,31 @@ function localTimeAt(date, minute, meta) {
   }
   return null;
 }
-function twilightAt(s, now) {
-  const date = localParts(now, s).date, astro = s.astro.find(a => a.date === date);
-  if (!astro) return null;
-  const sunset = localTimeAt(date, astro.set, s), sunrise = localTimeAt(date, astro.rise, s);
-  if (sunset !== null && now >= sunset - 45 * MINUTE && now < sunset + 75 * MINUTE) {
-    return { phase: 'dusk', amount: (now - sunset + 45 * MINUTE) / (120 * MINUTE) };
-  }
-  if (sunrise !== null && now >= sunrise - 45 * MINUTE && now < sunrise + 30 * MINUTE) {
-    return { phase: 'dawn', amount: (now - sunrise + 45 * MINUTE) / (75 * MINUTE) };
-  }
-  return null;
-}
-function solarTimeline(s, now, hours) {
-  const events = [], last = hours.at(-1).at;
+function solarEvents(s) {
+  const events = [];
   for (const a of s.astro) {
     if (finite(a.rise) && finite(a.set) && a.rise >= a.set) continue;
-    for (const [event, minute] of [['sunrise', a.rise], ['sunset', a.set]]) {
+    for (const [event, minute] of [['sunset', a.set], ['sunrise', a.rise]]) {
       const at = localTimeAt(a.date, minute, s);
-      if (at === null || at <= now || at > last) continue;
-      const p = localParts(at, s);
-      // No minute temperatures are available; show the solar event name instead.
-      events.push({ at, event, temperature: null, missing: false,
-        label: `${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')}` });
+      if (at !== null) events.push({ date: a.date, at, event, start: at - 45 * MINUTE,
+        end: at + (event === 'sunrise' ? 30 : 75) * MINUTE });
     }
   }
-  const eventTimes = new Set(events.map(e => e.at));
-  return [...hours.filter(h => !eventTimes.has(h.at)), ...events].sort((a, b) => a.at - b.at).slice(0, 6);
+  return events;
+}
+function twilightAt(events, today, now) {
+  const e = events.find(e => e.date === today && now >= e.start && now < e.end);
+  return e ? { phase: e.event === 'sunrise' ? 'dawn' : 'dusk', amount: (now - e.start) / (e.end - e.start) } : null;
+}
+function solarTimeline(s, events, now, hours) {
+  const upcoming = events.filter(e => e.at > now && e.at <= hours.at(-1).at).map(({ at, event }) => {
+    const p = localParts(at, s);
+    // No minute temperatures are available; show the solar event name instead.
+    return { at, event, temperature: null, missing: false,
+      label: `${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')}` };
+  });
+  const eventTimes = new Set(upcoming.map(e => e.at));
+  return [...hours.filter(h => !eventTimes.has(h.at)), ...upcoming].sort((a, b) => a.at - b.at).slice(0, 6);
 }
 export function viewModel(s, config, geo, now, stale = false) {
   const today = localParts(now, s).date;
@@ -366,10 +364,10 @@ export function viewModel(s, config, geo, now, stale = false) {
     const label = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(`${date}T12:00:00Z`).getUTCDay()];
     return { date, label, low: d?.low ?? null, high: d?.high ?? null, code: d?.code || 'UNKNOWN', missing: !d };
   });
-  const timeline = solarTimeline(s, now, hours);
-  const twilight = twilightAt(s, now), notice = !stale && s.notice?.until > now ? s.notice : null;
-  const boundaries = s.astro.flatMap(a => [localTimeAt(a.date, a.rise, s), localTimeAt(a.date, a.set, s)])
-    .filter(finite).flatMap(at => [at - 45 * MINUTE, at]).filter(at => at > now);
+  // Resolve astronomy once for the timeline, sky colors and refresh boundaries.
+  const events = solarEvents(s), timeline = solarTimeline(s, events, now, hours);
+  const twilight = twilightAt(events, today, now), notice = !stale && s.notice?.until > now ? s.notice : null;
+  const boundaries = events.flatMap(e => [e.start, e.at, e.end]).filter(at => at > now);
   const midnight = localTimeAt(nextDate(today, 1), 0, s);
   const nextChangeAt = Math.min(midnight ?? hours[0].at, ...boundaries,
     twilight ? (Math.floor(now / (15 * MINUTE)) + 1) * 15 * MINUTE : Infinity);
