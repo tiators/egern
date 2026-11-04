@@ -374,15 +374,17 @@ function solarTimeline(s, events, now, hours) {
 const weekday = date => ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(`${date}T12:00:00Z`).getUTCDay()];
 const PRECIPITATION_LABELS = { rain: '有雨', storm: '有雷雨', snow: '有雪', mixed: '有雨夹雪', ice: '有冻雨', hail: '有冰雹' };
 function eveningOverview(s, local, futureDays) {
-  // Only local hours 20 through 23 select this layout.
-  if (local.hour < 20) return null;
+  // Only local hours 21 through 23 select this layout.
+  if (local.hour < 21) return null;
   const today = todayForecast(s, local.date), tomorrow = futureDays[0];
   const next = condition(tomorrow.code), wet = PRECIPITATION_LABELS[next.kind] || '';
-  const delta = finite(tomorrow.high) && finite(today?.high) ? tomorrow.high - today.high : 0;
+  const delta = finite(tomorrow.high) && finite(today?.high) ? Math.round(tomorrow.high) - Math.round(today.high) : 0;
   // Temperature differences only affect the caption, never the layout.
-  const change = delta <= -4 ? '气温降低' : delta >= 4 ? '气温升高' : '';
-  const caption = change || wet ? `明天${change}${change && wet ? '且' : ''}${wet}`
+  const change = delta < 0 ? '气温降低' : delta > 0 ? '气温升高' : '';
+  const headline = change ? `明天${change}${wet ? `且${wet}` : '，最高'}`
     : next.kind === 'unknown' ? '明日天气暂无数据' : `明天${next.label}`;
+  const detail = finite(tomorrow.high) ? `${change && !wet ? '' : '最高'}气温${temperatureText(tomorrow.high)}` : '';
+  const caption = detail ? `${headline}\n${detail}` : headline;
   return { text: caption, wet: Boolean(wet), days: [
     { date: local.date, low: today?.low ?? null, high: today?.high ?? null, code: codeOf(today?.code), label: weekday(local.date) },
     ...futureDays.slice(0, 4),
@@ -711,20 +713,21 @@ function mediumContent(m, p) {
 }
 function overviewContent(m, p) {
   // Explicit shared height keeps both columns aligned on standard and compact iPhones.
-  const height = 126;
+  const height = 134;
   const left = column([
     leading(text(m.title, p.title, { weight: 'medium' }), lineHeight(p.title)),
     leading(text(temperatureText(m.temperature), p.temperature, { weight: 'light' }), lineHeight(p.temperature)),
-    spacer(), leading({ ...image(`sf-symbol:${m.overview.wet ? 'umbrella.fill' : 'thermometer'}`, 18, 18), color: UI.white }, 18), spacer(3),
-    leading(text(m.overview.text, 12, { weight: 'medium', minScale: .65 }), 15),
-    ...(m.stale ? [spacer(2), updateLabel(m.fetchedAt)] : []),
-  ], { flex: 1, height });
-  const rows = m.overview.days.map(d => row([
-    text(d.label, 13, { weight: 'medium' }), spacer(7),
-    d.missing || d.code === 'UNKNOWN' ? { ...centered(text('—', 13, { opacity: .4 }), 20), width: 22 } : icon(d.code, true, 22, 20),
-    column([trailing(text(temperatureText(d.low), 14, { weight: 'medium', opacity: .45 }), 20)], { flex: 1 }),
-    column([trailing(text(temperatureText(d.high).replace('°', ''), 14, { weight: 'medium' }), 20)], { width: 28 }),
-  ], { height: 20 }));
+    spacer(), leading({ ...image(`sf-symbol:${m.overview.wet ? 'umbrella.fill' : 'thermometer'}`, 16, 16), color: UI.white }, 16), spacer(2),
+    ...m.overview.text.split('\n').map(line => leading(text(line, 12, { weight: 'medium', minScale: .65 }), 15)),
+    ...(m.stale ? [updateLabel(m.fetchedAt)] : []),
+  ], { flex: 1.06, height });
+  const number = (value, opacity = 1) => column([trailing(text(temperatureText(value).replace('°', ''), 14,
+    { weight: 'medium', opacity, textAlign: 'right' }), 20)], { width: 20 });
+  const rows = m.overview.days.map((d, i) => row([
+    column([leading(text(d.label, 13, { weight: 'medium' }), 20)], { width: 28 }),
+    d.missing || d.code === 'UNKNOWN' ? { ...centered(text('—', 13, { opacity: .4 }), 20), width: 22 } : icon(d.code, i === 0 ? m.isDay : true, 22, 20),
+    number(d.low, .38), rangeBar(d, m.overview.days), number(d.high),
+  ], { height: 20, gap: 4 }));
   const right = column(rows.flatMap((r, i) => i ? [spacer(), r] : [r]), { flex: 1.15, height });
   return [spacer(), row([left, spacer(12), right], { height, alignItems: 'start' }), spacer()];
 }
