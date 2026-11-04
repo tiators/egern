@@ -3,6 +3,8 @@
  * Two fixed storage keys, limited to 4 KiB total. Tickets remain in memory.
  */
 const H5 = 'https://h5.caiyunapp.com';
+// Hand the website to the browser through Egern's documented callback.
+const WIDGET_TAP_URL = `egern:/connections?x-success=${encodeURIComponent(`${H5}/h5`)}`;
 const GEO_URL = 'https://starplucker.cyapi.cn/v3/geo/geocode';
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
@@ -299,21 +301,22 @@ function prune(s, now) {
     days: s.days.filter(d => d.date > date), astro: s.astro.filter(a => a.date >= date) };
 }
 const FALLBACK_DAY = { rise: 6 * 60, set: 18 * 60 };
+const TWILIGHT_MINUTES = { before: 45, afterRise: 30, afterSet: 75 };
 function daylightRange(snapshot, date, code) {
   const a = snapshot.astro.find(a => a.date === date);
   const rise = finite(a?.rise), set = finite(a?.set);
   if (rise && set && a.rise < a.set) return a;
-  // Keep the known solar boundary. Only the missing side uses a fallback.
+  // Keep the known solar boundary and its twilight window clear of the fallback.
   if (rise !== set) return {
-    rise: rise ? a.rise : a.set > FALLBACK_DAY.rise ? FALLBACK_DAY.rise : 0,
-    set: set ? a.set : a.rise < FALLBACK_DAY.set ? FALLBACK_DAY.set : 1440,
+    rise: rise ? a.rise : a.set - TWILIGHT_MINUTES.before > FALLBACK_DAY.rise ? FALLBACK_DAY.rise : 0,
+    set: set ? a.set : a.rise + TWILIGHT_MINUTES.afterRise < FALLBACK_DAY.set ? FALLBACK_DAY.set : 1440,
   };
   return /_(DAY|NIGHT)$/.test(code) ? null : FALLBACK_DAY;
 }
-function daytime(at, snapshot, code) {
-  const p = localParts(at, snapshot), range = daylightRange(snapshot, p.date, code);
+function daytime(local, snapshot, code) {
+  const range = daylightRange(snapshot, local.date, code);
   if (!range) return code.endsWith('_DAY');
-  const minute = p.hour * 60 + p.minute;
+  const minute = local.hour * 60 + local.minute;
   return minute >= range.rise && minute < range.set;
 }
 const CONDITIONS = Object.freeze({
@@ -348,8 +351,8 @@ function solarEvents(s) {
     if (finite(a.rise) && finite(a.set) && a.rise >= a.set) continue;
     for (const [event, minute] of [['sunset', a.set], ['sunrise', a.rise]]) {
       const at = localTimeAt(a.date, minute, s);
-      if (at !== null) events.push({ date: a.date, at, event, start: at - 45 * MINUTE,
-        end: at + (event === 'sunrise' ? 30 : 75) * MINUTE });
+      if (at !== null) events.push({ date: a.date, at, event, start: at - TWILIGHT_MINUTES.before * MINUTE,
+        end: at + (event === 'sunrise' ? TWILIGHT_MINUTES.afterRise : TWILIGHT_MINUTES.afterSet) * MINUTE });
     }
   }
   return events;
@@ -407,9 +410,9 @@ export function viewModel(s, config, geo, now, stale = false) {
   const local = localParts(now, s), today = local.date;
   const byHour = new Map(s.hours.map(h => [h.at, h]));
   const hours = futureHours(now, s, 6).map(at => {
-    const h = byHour.get(at);
+    const h = byHour.get(at), parts = localParts(at, s);
     return { at, temperature: h?.temperature ?? null, code: h?.code || 'UNKNOWN', cloud: h?.cloud,
-      label: `${localParts(at, s).hour}时`, day: daytime(at, s, h?.code || ''), missing: !h };
+      label: `${parts.hour}时`, day: daytime(parts, s, h?.code || ''), missing: !h };
   });
   const futureDays = Array.from({ length: FORECAST_DAYS }, (_, i) => {
     const date = nextDate(today, i + 1), d = s.days.find(d => d.date === date);
@@ -420,10 +423,11 @@ export function viewModel(s, config, geo, now, stale = false) {
   const events = solarEvents(s), timeline = solarTimeline(s, events, now, hours);
   const twilight = twilightAt(events, today, now), notice = stale ? null : displayNotice(s, now);
   const boundaries = events.flatMap(e => [e.start, e.at, e.end]).filter(at => at > now);
-  // Schedule actual and fallback daylight boundaries without inventing solar events.
+  // Actual solar boundaries are already scheduled above; add only missing fallbacks.
   const daylight = daylightRange(s, today, s.current.code);
   if (daylight) {
-    for (const minute of [daylight.rise, daylight.set]) {
+    for (const [event, minute] of [['sunrise', daylight.rise], ['sunset', daylight.set]]) {
+      if (events.some(e => e.date === today && e.event === event)) continue;
       const at = localTimeAt(today, minute, s);
       if (at !== null && at > now) boundaries.push(at);
     }
@@ -434,7 +438,7 @@ export function viewModel(s, config, geo, now, stale = false) {
   return { title: config.title || geo?.name || config.region, ...s.current, ...condition(s.current.code),
     today: todayTemperatures(s, today), hours: timeline, futureDays, nextChangeAt, nextHourAt: hours[0].at, notice,
     overview: eveningOverview(s, local, futureDays),
-    isDay: daytime(now, s, s.current.code), twilight, stale, fetchedAt: s.fetchedAt };
+    isDay: daytime(local, s, s.current.code), twilight, stale, fetchedAt: s.fetchedAt };
 }
 
 // ---------- Icons: embedded SVG artwork on a shared canvas ----------
@@ -600,7 +604,7 @@ const row = (children, extra = {}) => ({ type: 'stack', direction: 'row', alignI
 const column = (children, extra = {}) => ({ type: 'stack', direction: 'column', alignItems: 'start', children, ...extra });
 const spacer = length => length === undefined ? { type: 'spacer' } : { type: 'spacer', length };
 const image = (src, width, height) => ({ type: 'image', src, width, height, resizeMode: 'contain' });
-const icon = (code, day, width, height = width, overview = false, cloud) => image(iconSource(code, day, overview, cloud).src, width, height);
+const icon = (code, day, width, height, overview = false, cloud) => image(iconSource(code, day, overview, cloud).src, width, height);
 const leading = (node, height) => row([node, spacer()], { height });
 const trailing = (node, height) => row([spacer(), node], { height });
 const centered = (node, height) => row([spacer(), node, spacer()], { height });
@@ -741,11 +745,11 @@ export function renderWidget(m, family, refreshAt) {
   const noticeRefresh = large ? m.notice?.until ?? Infinity : Infinity;
   const hourlyRefresh = small || overview ? Infinity : m.nextHourAt ?? Infinity;
   const gradient = themeFor(m);
-  return { type: 'widget', padding: p.padding, gap: 0, backgroundGradient: gradient, backgroundImage: skyBackground(gradient, family),
+  return { type: 'widget', url: WIDGET_TAP_URL, padding: p.padding, gap: 0, backgroundGradient: gradient, backgroundImage: skyBackground(gradient, family),
     refreshAfter: new Date(Math.min(refreshAt, m.nextChangeAt ?? refreshAt, noticeRefresh, hourlyRefresh)).toISOString(), children: render(m, p) };
 }
 function messageWidget(config, family, message, refreshAt) {
-  return { type: 'widget', padding: 12, backgroundGradient: themeFor({ isDay: false }),
+  return { type: 'widget', url: WIDGET_TAP_URL, padding: 12, backgroundGradient: themeFor({ isDay: false }),
     refreshAfter: new Date(refreshAt).toISOString(),
     children: [text(config.title || config.region || '配置天气地区', 14), spacer(),
       text('—', 34), text(message, 11, { maxLines: family === 'systemSmall' ? 2 : 3, opacity: 0.85 }), spacer()] };
