@@ -1,0 +1,13 @@
+# 合并到现有 Egern 配置；保留原有网络规则。
+# 在 Egern 工具 → 脚本中创建本地文件 caiyun-weather-widget.js。
+scriptings:
+  - generic:
+      name: "weather-widget"
+      script_url: "https://raw.githubusercontent.com/tiators/egern/refs/heads/main/scripts/caiyun-weather-widget.js"
+      timeout: 25
+widgets:
+  - name: "彩云天气"
+    script_name: "weather-widget"
+    env:
+      CAIYUN_TOKEN: "Y2FpeXVuX25vdGlmeQ=="
+      CITY: "杭州市西湖区"
