@@ -1,0 +1,13 @@
+# script_url 必须换成你能访问到的 caiyun.js 地址（见 README）。
+scriptings:
+  - generic:
+      name: "caiyun-weather"
+      script_url: "https://raw.githubusercontent.com/tiators/egern/refs/heads/main/scripts/caiyun.js"
+      timeout: 20
+
+widgets:
+  - name: "caiyun-weather-widget"
+    script_name: "caiyun-weather"
+    env:
+      CAIYUN_TOKEN: "Y2FpeXVuX25vdGlmeQ=="
+      CITY: "上海市浦东新区"
